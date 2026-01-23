@@ -1,0 +1,687 @@
+================================================================================
+DCEMLID - BUILD INSTRUCTIONS
+================================================================================
+
+This document provides detailed instructions for compiling DCEMLID on both
+DOS/Windows systems and modern Linux systems.
+
+TABLE OF CONTENTS
+-----------------
+1. Quick Start
+2. Building on DOS/Windows with Borland Tools
+3. Building on Linux (Cross-compilation)
+4. Building on Windows 10/11
+5. Troubleshooting
+6. Advanced Build Options
+
+
+================================================================================
+1. QUICK START
+================================================================================
+
+DOS/Windows with Borland TASM:
+-------------------------------
+  C:\> TASM /m2 DCEMLID.ASM
+  C:\> TLINK /t DCEMLID.OBJ
+  C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+
+Or with Make:
+  C:\> MAKE dos
+
+Linux with DOSBox:
+------------------
+  $ make dosbox
+
+Linux with NASM (requires syntax conversion):
+---------------------------------------------
+  $ make linux
+
+
+================================================================================
+2. BUILDING ON DOS/WINDOWS WITH BORLAND TOOLS
+================================================================================
+
+Required Software:
+------------------
+- Borland Turbo Assembler (TASM) 3.0 or higher
+- Borland Turbo Link (TLINK) 3.0 or higher
+- EXE2BIN.EXE (included with DOS or Borland tools)
+
+Alternative: Microsoft MASM 5.0 or higher also works
+
+
+2.1 Installing Borland Turbo Assembler
+---------------------------------------
+
+Option A: Original Borland TASM (DOS/Windows 9x)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Download Borland Turbo Assembler 5.0 (freely available)
+   - Check Borland Community Edition or archive sites
+   - Version 5.0 is the last 16-bit version
+
+2. Install to C:\TASM or similar directory
+
+3. Add to PATH in AUTOEXEC.BAT:
+   SET PATH=%PATH%;C:\TASM\BIN
+
+4. Verify installation:
+   C:\> TASM
+   (Should display version and usage information)
+
+
+Option B: Borland C++ 5.02 (includes TASM)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Download Borland C++ 5.02 (free from Embarcadero)
+   Website: https://www.embarcadero.com/free-tools
+
+2. Install to C:\BC5 or similar
+
+3. Add to PATH:
+   SET PATH=%PATH%;C:\BC5\BIN
+
+4. Includes TASM, TLINK, and all required tools
+
+
+Option C: Turbo Assembler 3.0 (Minimal)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Download TASM 3.0 (smaller, faster)
+
+2. Extract files:
+   - TASM.EXE
+   - TLINK.EXE
+   - EXE2BIN.EXE (or use DOS version)
+
+3. Place in C:\BIN or C:\DOS
+
+4. Add to PATH
+
+
+2.2 Building with TASM
+-----------------------
+
+Method 1: Manual Command Line
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+C:\> TASM /m2 DCEMLID.ASM
+     Turbo Assembler  Version 5.0
+     Copyright (c) 1988, 1996 Borland International
+     
+     Assembling file:   DCEMLID.ASM
+     Passes:            1
+     ...
+
+C:\> TLINK /t DCEMLID.OBJ
+     Turbo Link  Version 5.0
+     Copyright (c) 1992, 1996 Borland International
+     ...
+
+C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+
+
+Method 2: Using Make
+~~~~~~~~~~~~~~~~~~~~~
+If you have Borland Make:
+
+C:\> MAKE -f Makefile dos
+
+Or Turbo Make:
+
+C:\> MAKER dos
+
+
+Method 3: Batch File
+~~~~~~~~~~~~~~~~~~~~
+Create BUILD.BAT:
+
+@ECHO OFF
+ECHO Building DCEMLID...
+TASM /m2 /zi DCEMLID.ASM
+IF ERRORLEVEL 1 GOTO ERROR
+TLINK /t /x DCEMLID.OBJ
+IF ERRORLEVEL 1 GOTO ERROR
+EXE2BIN DCEMLID.EXE DCEMLID.COM
+IF ERRORLEVEL 1 GOTO ERROR
+ECHO Build successful!
+GOTO END
+:ERROR
+ECHO Build failed!
+:END
+
+Run with:
+C:\> BUILD
+
+
+2.3 Assembler Flags Explained
+------------------------------
+
+TASM Flags:
+  /m2       - Enable multiple passes (required for 286+ instructions)
+  /zi       - Include debug information
+  /l        - Generate listing file (DCEMLID.LST)
+  /w2       - Enable all warnings
+  /c        - Case-sensitive labels
+  /jJUMPS   - Enable automatic jump sizing
+
+TLINK Flags:
+  /t        - Create .COM file format
+  /x        - No map file
+  /v        - Include debug information
+  /l        - Include line numbers in map
+
+Recommended for production:
+  TASM /m2 DCEMLID.ASM
+  TLINK /t /x DCEMLID.OBJ
+
+
+2.4 Building with Microsoft MASM
+---------------------------------
+
+If you have Microsoft MASM instead of TASM:
+
+C:\> MASM /Zi DCEMLID.ASM;
+C:\> LINK DCEMLID.OBJ;
+C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+
+MASM Flags:
+  /Zi       - Debug information
+  /Zd       - Line number information
+  /W2       - Warning level 2
+
+
+================================================================================
+3. BUILDING ON LINUX (CROSS-COMPILATION)
+================================================================================
+
+Linux can build DOS executables using several methods:
+
+3.1 Method 1: DOSBox with Borland TASM (Recommended)
+-----------------------------------------------------
+
+This method runs actual Borland tools in DOSBox emulator.
+
+Step 1: Install DOSBox
+~~~~~~~~~~~~~~~~~~~~~~~
+Ubuntu/Debian:
+  $ sudo apt-get update
+  $ sudo apt-get install dosbox
+
+Fedora:
+  $ sudo dnf install dosbox
+
+Arch Linux:
+  $ sudo pacman -S dosbox
+
+Step 2: Install Borland TASM in DOSBox
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Download Borland TASM 5.0 or Borland C++ 5.02
+
+2. Create a DOS directory:
+   $ mkdir -p ~/dos/tasm
+   $ mkdir -p ~/dos/project
+
+3. Copy TASM files to ~/dos/tasm/:
+   - TASM.EXE
+   - TLINK.EXE
+   - EXE2BIN.EXE
+   - TASM.EXE (and support files)
+
+4. Copy DCEMLID.ASM to ~/dos/project/
+
+Step 3: Create DOSBox Configuration
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Create ~/dos/build.conf:
+
+[sdl]
+fullscreen=false
+output=surface
+
+[dosbox]
+memsize=16
+
+[autoexec]
+mount c ~/dos
+c:
+path=c:\tasm;%path%
+cd \project
+
+Step 4: Build
+~~~~~~~~~~~~~
+$ cd ~/dos/project
+$ dosbox -conf ../build.conf -c "tasm /m2 dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exe2bin dcemlid.exe dcemlid.com" -c "exit"
+
+Or use the Makefile:
+$ make dosbox
+
+The resulting DCEMLID.COM will be in ~/dos/project/
+
+
+3.2 Method 2: DOSemu2 (Faster than DOSBox)
+-------------------------------------------
+
+DOSemu2 is a DOS emulator that runs faster than DOSBox.
+
+Step 1: Install DOSemu2
+~~~~~~~~~~~~~~~~~~~~~~~~
+Ubuntu/Debian (21.04+):
+  $ sudo apt-get install dosemu2
+
+Or build from source:
+  $ git clone https://github.com/dosemu2/dosemu2
+  $ cd dosemu2
+  $ ./default-configure
+  $ make
+  $ sudo make install
+
+Step 2: Setup FreeDOS
+~~~~~~~~~~~~~~~~~~~~~~
+  $ dosemu -install
+
+Step 3: Copy Tools
+~~~~~~~~~~~~~~~~~~
+  $ cp TASM.EXE ~/.dosemu/drive_c/
+  $ cp TLINK.EXE ~/.dosemu/drive_c/
+  $ cp DCEMLID.ASM ~/.dosemu/drive_c/
+
+Step 4: Build
+~~~~~~~~~~~~~
+  $ dosemu -E "TASM /m2 DCEMLID.ASM"
+  $ dosemu -E "TLINK /t DCEMLID.OBJ"
+  $ dosemu -E "EXE2BIN DCEMLID.EXE DCEMLID.COM"
+
+Result in ~/.dosemu/drive_c/DCEMLID.COM
+
+
+3.3 Method 3: NASM (Native Linux Assembler)
+--------------------------------------------
+
+NASM can assemble 16-bit DOS code, but requires syntax conversion.
+
+Step 1: Install NASM
+~~~~~~~~~~~~~~~~~~~~~
+Ubuntu/Debian:
+  $ sudo apt-get install nasm
+
+Fedora:
+  $ sudo dnf install nasm
+
+Arch:
+  $ sudo pacman -S nasm
+
+Step 2: Convert MASM/TASM Syntax to NASM
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+NASM uses different syntax than TASM. Key differences:
+
+TASM:                      NASM:
+-----                      -----
+.MODEL SMALL               (not needed)
+.286                       [CPU 286]
+.DATA                      section .data
+.CODE                      section .text
+STRUC                      struc
+ENDS                       endstruc
+PROC                       (use labels)
+ENDP                       (no equivalent)
+PTR                        (not needed)
+OFFSET                     (not needed)
+SEG                        (not needed)
+
+This conversion is complex and beyond the scope of this guide.
+Use DOSBox method instead for TASM syntax compatibility.
+
+
+3.4 Method 4: Cross-compilation with OpenWatcom
+------------------------------------------------
+
+OpenWatcom includes a cross-platform assembler.
+
+Step 1: Install OpenWatcom
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Download from: http://www.openwatcom.org/
+
+Linux:
+  $ wget https://github.com/open-watcom/open-watcom-v2/releases/download/Current-build/open-watcom-2_0-c-linux-x64
+  $ chmod +x open-watcom-2_0-c-linux-x64
+  $ sudo ./open-watcom-2_0-c-linux-x64
+
+Step 2: Setup Environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+  $ export WATCOM=/opt/watcom
+  $ export PATH=$WATCOM/binl64:$PATH
+
+Step 3: Build
+~~~~~~~~~~~~~
+  $ wasm -ms -0 dcemlid.asm
+  $ wlink system dos com file dcemlid.obj
+
+Note: May require minor syntax adjustments.
+
+
+================================================================================
+4. BUILDING ON WINDOWS 10/11
+================================================================================
+
+Modern Windows can run 16-bit DOS tools via DOSBox or WSL.
+
+4.1 Method 1: DOSBox on Windows
+--------------------------------
+
+Step 1: Install DOSBox
+~~~~~~~~~~~~~~~~~~~~~~~
+Download from: https://www.dosbox.com/
+Run installer: DOSBox-0.74-3-win32-installer.exe
+
+Step 2: Setup Build Environment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+1. Create C:\DOS\TASM
+2. Copy Borland TASM tools to C:\DOS\TASM
+3. Create C:\DOS\PROJECT
+4. Copy DCEMLID.ASM to C:\DOS\PROJECT
+
+Step 3: Create build.bat in C:\DOS\PROJECT
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+@echo off
+"C:\Program Files (x86)\DOSBox-0.74\dosbox.exe" -c "mount c c:\dos" -c "c:" -c "path=c:\tasm" -c "cd \project" -c "tasm /m2 dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exe2bin dcemlid.exe dcemlid.com" -c "exit"
+
+Step 4: Build
+~~~~~~~~~~~~~
+Double-click build.bat or run from Command Prompt:
+C:\DOS\PROJECT> build.bat
+
+
+4.2 Method 2: WSL (Windows Subsystem for Linux)
+------------------------------------------------
+
+Windows 10/11 includes Linux subsystem.
+
+Step 1: Enable WSL
+~~~~~~~~~~~~~~~~~~
+In PowerShell (as Administrator):
+  > wsl --install
+  > wsl --install -d Ubuntu
+
+Reboot, then:
+  > wsl
+
+Step 2: Follow Linux Instructions
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+See section 3 above. Use DOSBox method in WSL:
+
+$ sudo apt update
+$ sudo apt install dosbox
+$ make dosbox
+
+
+4.3 Method 3: Native 64-bit Tools (Limited)
+--------------------------------------------
+
+Some modern assemblers claim MASM compatibility:
+
+JWasm (MASM-compatible):
+  Download: https://github.com/JWasm/JWasm
+  Usage: jwasm -mz dcemlid.asm
+
+Note: May require syntax modifications.
+
+
+================================================================================
+5. TROUBLESHOOTING
+================================================================================
+
+Problem: "Bad command or file name" when running TASM
+------------------------------------------------------
+Solution:
+  - Verify TASM.EXE is in PATH
+  - Run: SET PATH=%PATH%;C:\TASM\BIN
+  - Or specify full path: C:\TASM\BIN\TASM.EXE
+
+
+Problem: "Segment or group alignment too large"
+------------------------------------------------
+Solution:
+  - Use TLINK /t flag for .COM format
+  - Ensure .MODEL SMALL is specified
+
+
+Problem: "Undefined symbol" errors
+-----------------------------------
+Solution:
+  - Enable multiple passes: TASM /m2
+  - Check for circular dependencies
+  - Verify all symbols are defined
+
+
+Problem: "File not found" in TLINK
+-----------------------------------
+Solution:
+  - Ensure DCEMLID.OBJ exists
+  - Check file is in current directory
+  - Use: DIR DCEMLID.*
+
+
+Problem: DOSBox "mount: not a valid directory"
+-----------------------------------------------
+Solution:
+  - Use absolute path: mount c /home/user/dos
+  - Ensure directory exists
+  - Check permissions
+
+
+Problem: "This program cannot be run in DOS mode"
+--------------------------------------------------
+Solution:
+  - You have .EXE instead of .COM
+  - Run EXE2BIN to convert
+  - Or use TLINK /t flag
+
+
+Problem: Build succeeds but driver doesn't work
+------------------------------------------------
+Solution:
+  - Test on real DOS system or DOSBox
+  - Check LSL is loaded first
+  - Verify hardware availability
+  - Review error messages
+
+
+Problem: "Insufficient memory" during build
+--------------------------------------------
+Solution:
+  - Close other DOS programs
+  - Use TASM /m2 only (remove /zi)
+  - Increase DOSBox memory: memsize=32
+
+
+================================================================================
+6. ADVANCED BUILD OPTIONS
+================================================================================
+
+6.1 Debug Build
+---------------
+
+For debugging with Turbo Debugger (TD):
+
+  TASM /m2 /zi /l DCEMLID.ASM
+  TLINK /t /v DCEMLID.OBJ
+  TD DCEMLID.COM
+
+The /zi and /v flags include symbol information.
+
+
+6.2 Optimized Release Build
+----------------------------
+
+For smallest, fastest code:
+
+  TASM /m2 /ml DCEMLID.ASM
+  TLINK /t /x DCEMLID.OBJ
+  EXE2BIN DCEMLID.EXE DCEMLID.COM
+
+The /ml flag enables all optimizations.
+
+
+6.3 Listing File Generation
+----------------------------
+
+To generate assembly listing:
+
+  TASM /m2 /l DCEMLID.ASM
+
+Creates DCEMLID.LST with:
+  - Source code
+  - Generated opcodes
+  - Symbol table
+  - Cross-reference
+
+
+6.4 Map File Generation
+------------------------
+
+To generate link map:
+
+  TLINK /t /m DCEMLID.OBJ
+
+Creates DCEMLID.MAP with:
+  - Segment layout
+  - Public symbols
+  - Memory usage
+
+
+6.5 Conditional Assembly
+-------------------------
+
+To enable/disable features during build:
+
+  TASM /m2 /dDEBUG=1 DCEMLID.ASM
+
+Then in source:
+  IFDEF DEBUG
+    ; Debug code here
+  ENDIF
+
+
+6.6 Cross-Reference Generation
+-------------------------------
+
+  TASM /m2 /c /l DCEMLID.ASM
+
+The /c flag adds cross-references to listing.
+
+
+6.7 Multiple Target Build
+--------------------------
+
+Create different versions:
+
+  TASM /m2 /dSERIAL_ONLY=1 DCEMLID.ASM
+  TLINK /t DCEMLID.OBJ
+  REN DCEMLID.COM DCESER.COM
+
+  TASM /m2 /dPARALLEL_ONLY=1 DCEMLID.ASM  
+  TLINK /t DCEMLID.OBJ
+  REN DCEMLID.COM DCEPAR.COM
+
+
+================================================================================
+RECOMMENDED BUILD ENVIRONMENTS
+================================================================================
+
+Best Option for Each Platform:
+-------------------------------
+
+DOS:        Borland TASM 5.0 (native, fastest)
+Windows 9x: Borland TASM 5.0 (native)
+Windows 10: DOSBox + TASM 5.0
+Linux:      DOSBox + TASM 5.0 or dosemu2 + TASM
+macOS:      DOSBox + TASM 5.0
+
+Modern Dev: DOSBox-X + TASM 5.0 (best compatibility)
+
+
+Where to Get Borland TASM:
+---------------------------
+
+1. Embarcadero Free Tools:
+   https://www.embarcadero.com/free-tools
+   (Borland C++ 5.02 includes TASM)
+
+2. Internet Archive:
+   https://archive.org/
+   Search for "Borland Turbo Assembler"
+
+3. Hobbyist Redistribution:
+   Many DOS programming sites host TASM
+   (Verify license compliance)
+
+
+================================================================================
+BUILD VERIFICATION
+================================================================================
+
+After building, verify the result:
+
+1. Check file size:
+   DIR DCEMLID.COM
+   Should be approximately 8-32KB
+
+2. Check file type:
+   TYPE DCEMLID.COM | MORE
+   Should show MZ header for .EXE or binary code for .COM
+
+3. Test in DOSBox:
+   dosbox
+   mount c .
+   c:
+   dcemlid /?
+   (Should display help screen)
+
+4. Verify with DEBUG:
+   DEBUG DCEMLID.COM
+   -u 100
+   (Should show assembly instructions starting at 0100h)
+
+
+================================================================================
+CONTINUOUS INTEGRATION
+================================================================================
+
+For automated builds, use Docker with DOSBox:
+
+Dockerfile:
+-----------
+FROM ubuntu:20.04
+RUN apt-get update && apt-get install -y dosbox make
+COPY . /build
+WORKDIR /build
+CMD ["make", "dosbox"]
+
+Build:
+------
+$ docker build -t dcemlid-build .
+$ docker run --rm -v $(pwd):/build dcemlid-build
+
+
+================================================================================
+ADDITIONAL RESOURCES
+================================================================================
+
+Documentation:
+--------------
+- TASM User's Guide (TASM.DOC)
+- TLINK User's Guide (TLINK.DOC)
+- Borland C++ Tools Help (BC5.HLP)
+
+Online Resources:
+-----------------
+- x86 Assembly Language Reference
+- DOS interrupt list (RBIL - Ralf Brown's Interrupt List)
+- ODI specification documents
+
+Communities:
+------------
+- VOGONS Forum (dosbox.com/forum)
+- Reddit r/retrobattlestations
+- Vintage Computer Forum
+
+
+================================================================================
+END OF BUILD INSTRUCTIONS
+================================================================================

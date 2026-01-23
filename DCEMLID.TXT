@@ -1,0 +1,747 @@
+================================================================================
+DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection
+Documentation and User Guide
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview
+2. System Requirements
+3. Installation
+4. Configuration Options
+5. Usage Examples
+6. Cable Wiring
+7. Troubleshooting
+8. Technical Specifications
+9. Performance Tips
+10. Known Limitations
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+DCEMLID is a Terminate-and-Stay-Resident (TSR) network driver that implements
+the Novell ODI (Open Data-Link Interface) MLID specification. It enables 
+point-to-point IPX networking between two DOS computers using either:
+
+  - Serial null-modem cables (9600-115200 baud)
+  - Parallel cables (4-bit SPP or 8-bit EPP/PS2 mode)
+
+The driver integrates with Novell's Link Support Layer (LSL) to provide
+transparent network connectivity for IPX-based applications like NetWare,
+games, and file transfer utilities.
+
+Key Features:
+  * Configurable MAC addresses
+  * Hardware (RTS/CTS) and software (XON/XOFF) flow control
+  * Automatic 16550 UART detection with FIFO support
+  * EPP and PS/2 bidirectional parallel port support
+  * CRC16-CCITT error detection with automatic retry
+  * 512-byte MTU optimized for low latency
+  * Automatic UMB (Upper Memory Block) loading on DOS 5.0+
+  * Clean unload capability
+
+
+================================================================================
+2. SYSTEM REQUIREMENTS
+================================================================================
+
+Minimum Requirements:
+  - IBM PC/XT/AT or compatible
+  - DOS 3.3 or higher (DOS 5.0+ recommended for UMB support)
+  - 8088/8086 CPU or higher
+  - 32KB free conventional memory (or 8KB with UMB)
+  - Novell LSL.COM loaded before DCEMLID
+
+For Serial Mode:
+  - 8250 or 16550 UART (16550 strongly recommended for >38400 baud)
+  - Available COM port (COM1-COM4)
+  - Null-modem cable
+
+For Parallel Mode:
+  - Standard parallel port (LPT1-LPT3)
+  - PAR4: Any parallel port
+  - PAR8: EPP-capable port or PS/2 bidirectional port
+  - Parallel cable (standard for PAR4, special for PAR8)
+
+
+================================================================================
+3. INSTALLATION
+================================================================================
+
+Basic Installation Steps:
+--------------------------
+
+1. Ensure Novell LSL is loaded first:
+   
+   C:\> LSL
+
+2. Load DCEMLID with desired options:
+   
+   C:\> DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+
+3. Load IPX protocol stack:
+   
+   C:\> IPXODI
+
+4. Verify installation:
+   
+   C:\> IPXODI S
+   
+   You should see DCEMLID listed as the network adapter.
+
+Typical AUTOEXEC.BAT Configuration:
+------------------------------------
+
+@ECHO OFF
+CD \NWCLIENT
+LSL
+DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /FLOW=RTS
+IPXODI
+NETX
+CD \
+
+
+================================================================================
+4. CONFIGURATION OPTIONS
+================================================================================
+
+Command Line Syntax:
+--------------------
+DCEMLID [/MODE=mode] [/PORT=addr] [/BAUD=rate] [/FLOW=type] 
+        [/MAC=address] [/U] [/?]
+
+
+Option Details:
+---------------
+
+/MODE=SERIAL|PAR4|PAR8
+  Selects connection mode.
+  
+  SERIAL - Serial port communication (default)
+  PAR4   - 4-bit nibble mode over standard parallel port
+  PAR8   - 8-bit mode using EPP or PS/2 bidirectional port
+  
+  Default: SERIAL
+
+/PORT=addr
+  Sets the I/O port base address in hexadecimal.
+  
+  Serial ports:
+    3F8h - COM1 (default)
+    2F8h - COM2
+    3E8h - COM3
+    2E8h - COM4
+  
+  Parallel ports:
+    378h - LPT1 (default for parallel modes)
+    278h - LPT2
+    3BCh - LPT3
+  
+  Default: 3F8h (COM1) for serial, 378h (LPT1) for parallel
+
+/BAUD=rate
+  Sets serial baud rate (serial mode only).
+  
+  Valid rates: 9600, 19200, 38400, 57600, 115200
+  
+  Default: 115200
+  
+  Note: For 8250 UART, use 38400 or lower to avoid packet loss.
+
+/FLOW=RTS|XON
+  Sets flow control method (serial mode only).
+  
+  RTS - Hardware flow control using RTS/CTS lines (default)
+  XON - Software flow control using XON/XOFF characters
+  
+  Default: RTS
+  
+  Note: Hardware flow requires proper null-modem wiring.
+
+/MAC=xx-xx-xx-xx-xx-xx
+  Sets the MAC address manually.
+  
+  Format: Six hex bytes separated by hyphens
+  Example: /MAC=02-60-8C-12-34-56
+  
+  Default: Random MAC generated from BIOS timer
+  
+  Note: Each computer must have a unique MAC address.
+
+/U
+  Unloads the driver from memory.
+  
+  Example: DCEMLID /U
+  
+  Note: Driver must be idle (no active transfers) to unload.
+
+/?
+  Displays help screen with cable wiring diagrams.
+
+
+================================================================================
+5. USAGE EXAMPLES
+================================================================================
+
+Example 1: Basic Serial Connection at Maximum Speed
+----------------------------------------------------
+Computer A:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  IPXODI
+
+Computer B:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  IPXODI
+
+Use: High-speed file transfers, multiplayer games
+Cable: Hardware flow control null-modem
+
+
+Example 2: Serial Connection with Software Flow Control
+--------------------------------------------------------
+Computer A:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=57600 /FLOW=XON
+  IPXODI
+
+Computer B:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=57600 /FLOW=XON
+  IPXODI
+
+Use: 3-wire null-modem cable (cheaper)
+Cable: 3-wire null-modem (TXD, RXD, GND only)
+
+
+Example 3: Laptop Serial Connection (COM2)
+-------------------------------------------
+Laptop A:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=2F8 /BAUD=57600 /MAC=02-AA-BB-CC-DD-01
+  IPXODI
+
+Laptop B:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=2F8 /BAUD=57600 /MAC=02-AA-BB-CC-DD-02
+  IPXODI
+
+Use: Laptop-to-laptop file transfer
+Note: Laptops often have only COM2 available
+
+
+Example 4: Parallel Connection (4-bit mode)
+--------------------------------------------
+Computer A:
+  LSL
+  DCEMLID /MODE=PAR4 /PORT=378
+  IPXODI
+
+Computer B:
+  LSL
+  DCEMLID /MODE=PAR4 /PORT=378
+  IPXODI
+
+Use: Systems without serial ports or with IRQ conflicts
+Cable: Standard parallel printer cable (bidirectional)
+
+
+Example 5: Parallel Connection (8-bit EPP mode)
+------------------------------------------------
+Computer A:
+  LSL
+  DCEMLID /MODE=PAR8 /PORT=378
+  IPXODI
+
+Computer B:
+  LSL
+  DCEMLID /MODE=PAR8 /PORT=378
+  IPXODI
+
+Use: Fastest parallel transfer with EPP-capable ports
+Cable: EPP parallel cable
+Note: Driver auto-detects EPP and falls back to PS/2 mode if unavailable
+
+
+Example 6: Old PC with 8250 UART
+---------------------------------
+Computer A (8250):
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=38400
+  IPXODI
+
+Computer B (16550):
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=38400
+  IPXODI
+
+Use: Reliable connection on old hardware
+Note: Driver warns when 8250 is used with baud >= 57600
+
+
+Example 7: NetWare Client Connection
+-------------------------------------
+Computer A (Server):
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /MAC=02-00-00-00-00-01
+  IPXODI
+  [Run NetWare server software]
+
+Computer B (Client):
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /MAC=02-00-00-00-00-02
+  IPXODI
+  NETX
+  F:
+  LOGIN
+
+Use: Access NetWare file server over direct cable
+
+
+Example 8: Doom/Duke Nukem 3D Multiplayer
+------------------------------------------
+Computer A:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  IPXODI
+  DOOM -nodes 2 -port 0x869
+
+Computer B:
+  LSL
+  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  IPXODI
+  DOOM -nodes 2 -port 0x869
+
+Use: IPX multiplayer gaming
+
+
+Example 9: Unloading the Driver
+--------------------------------
+To unload DCEMLID after use:
+
+  NETX /U          (unload NetWare client if loaded)
+  IPXODI /U        (unload IPX)
+  DCEMLID /U       (unload DCEMLID)
+  LSL /U           (unload LSL)
+
+Note: Unload in reverse order of loading
+
+
+================================================================================
+6. CABLE WIRING
+================================================================================
+
+Serial Null-Modem Cable Wiring (DB9)
+-------------------------------------
+
+Hardware Flow Control (5-wire):
+---------------------------------
+
+  DB9 Female         DB9 Female
+  Computer A         Computer B
+  ----------         ----------
+  Pin 2 (RXD) <------- Pin 3 (TXD)
+  Pin 3 (TXD) -------> Pin 2 (RXD)
+  Pin 7 (RTS) <------- Pin 8 (CTS)
+  Pin 8 (CTS) -------> Pin 7 (RTS)
+  Pin 5 (GND) <------> Pin 5 (GND)
+
+Use with: /FLOW=RTS (default)
+Best for: High-speed transfers (57600-115200 baud)
+
+
+Software Flow Control (3-wire):
+--------------------------------
+
+  DB9 Female         DB9 Female
+  Computer A         Computer B
+  ----------         ----------
+  Pin 2 (RXD) <------- Pin 3 (TXD)
+  Pin 3 (TXD) -------> Pin 2 (RXD)
+  Pin 5 (GND) <------> Pin 5 (GND)
+
+Use with: /FLOW=XON
+Best for: Simple cables, medium-speed (9600-57600 baud)
+
+
+DB9 to DB25 Adapter Pinout:
+----------------------------
+If one computer has DB25 serial port:
+
+  DB9 Pin    DB25 Pin    Signal
+  -------    --------    ------
+    1          8         DCD
+    2          3         RXD
+    3          2         TXD
+    4          20        DTR
+    5          7         GND
+    6          6         DSR
+    7          4         RTS
+    8          5         CTS
+    9          22        RI
+
+
+Parallel Cable Wiring (DB25)
+-----------------------------
+
+PAR4 Mode (4-bit Standard):
+----------------------------
+Use any standard bidirectional parallel printer cable.
+No special wiring required.
+
+
+PAR8 Mode (8-bit EPP/PS2):
+---------------------------
+
+  DB25 Male          DB25 Male
+  Computer A         Computer B
+  ----------         ----------
+  Pin 1 (STROBE) <--> Pin 1 (STROBE)
+  Pin 2 (D0)     <--> Pin 15 (ERROR)
+  Pin 3 (D1)     <--> Pin 13 (SELECT)
+  Pin 4 (D2)     <--> Pin 12 (PE)
+  Pin 5 (D3)     <--> Pin 10 (ACK)
+  Pin 6 (D4)     <--> Pin 11 (BUSY)
+  Pin 7 (D5)     <--> Pin 2 (D0)
+  Pin 8 (D6)     <--> Pin 3 (D1)
+  Pin 9 (D7)     <--> Pin 4 (D2)
+  Pin 10 (ACK)   <--> Pin 5 (D3)
+  Pin 11 (BUSY)  <--> Pin 6 (D4)
+  Pin 12 (PE)    <--> Pin 7 (D5)
+  Pin 13 (SELECT)<--> Pin 8 (D6)
+  Pin 14 (AUTOFD)<--> Pin 14 (AUTOFD)
+  Pin 15 (ERROR) <--> Pin 9 (D7)
+  Pin 16 (INIT)  <--> Pin 16 (INIT)
+  Pin 17 (SLCT)  <--> Pin 17 (SLCT)
+  Pins 18-25 (GND)   Pins 18-25 (GND)
+
+Note: This is a complex cable. Commercial parallel transfer cables
+      (like LapLink or Interlink cables) may work.
+
+
+================================================================================
+7. TROUBLESHOOTING
+================================================================================
+
+Problem: "ERROR: LSL not loaded"
+Solution: Load LSL.COM before DCEMLID. Check that LSL.COM is in your path.
+
+
+Problem: "ERROR: Driver already loaded"
+Solution: Unload existing driver with DCEMLID /U, or reboot.
+
+
+Problem: "ERROR: IRQ conflict detected"
+Solution: 
+  - Try different COM port (/PORT=2F8 for COM2)
+  - Check IRQ assignments with MSD.EXE
+  - Disable conflicting devices in BIOS
+
+
+Problem: "ERROR: Hardware not detected at specified port"
+Solution:
+  - Verify port address (use MSD.EXE to check)
+  - Ensure serial/parallel port is enabled in BIOS
+  - Check cable is properly connected
+  - Try different port
+
+
+Problem: "WARNING: 8250 UART detected at high baud rate"
+Solution:
+  - Reduce baud rate to 38400 or lower
+  - Upgrade to 16550 UART (available as ISA cards)
+  - Accept warning and test if it works anyway
+
+
+Problem: Very slow or no data transfer
+Solution:
+  - Check cable wiring matches flow control setting
+  - Verify both computers use same MODE, BAUD, and FLOW settings
+  - Ensure unique MAC addresses on each computer
+  - Try lower baud rate
+  - Check for IRQ conflicts with other devices
+
+
+Problem: Frequent CRC errors or timeouts
+Solution:
+  - Reduce baud rate (try 57600 instead of 115200)
+  - Check cable quality and length (keep under 10 feet)
+  - Use hardware flow control (/FLOW=RTS)
+  - Verify proper cable wiring
+  - Check for electromagnetic interference
+
+
+Problem: Driver won't unload
+Solution:
+  - Unload network clients first (NETX /U)
+  - Unload IPXODI before DCEMLID
+  - Ensure no active transfers
+  - Reboot if necessary
+
+
+Problem: Parallel mode not working
+Solution:
+  - Verify parallel port is set to bidirectional/EPP in BIOS
+  - Try PAR4 mode instead of PAR8
+  - Check cable is truly bidirectional (standard printer cables are unidirectional)
+  - Ensure no printer driver is using LPT port
+
+
+Problem: "Driver busy, cannot unload"
+Solution:
+  - Close all network applications
+  - Wait a few seconds
+  - Unload NETX and IPXODI first
+
+
+Problem: DOS runs out of conventional memory
+Solution:
+  - Use DOS 5.0 or higher for automatic UMB loading
+  - Configure CONFIG.SYS with:
+      DOS=HIGH,UMB
+      DEVICE=C:\DOS\HIMEM.SYS
+      DEVICE=C:\DOS\EMM386.EXE NOEMS
+  - Load DCEMLID after memory managers
+
+
+================================================================================
+8. TECHNICAL SPECIFICATIONS
+================================================================================
+
+Protocol Specifications:
+------------------------
+Frame Format: SLIP-like with start/end delimiters (0xC0)
+MTU Size: 512 bytes
+Error Detection: CRC16-CCITT (polynomial 0x1021, init 0xFFFF)
+Retry Mechanism: 2 retries with 200ms timeout and exponential backoff
+Frame Type: IEEE 802.3 (Ethernet)
+Sequence Numbers: 8-bit with duplicate detection
+
+Serial Mode:
+------------
+Supported Baud Rates: 9600, 19200, 38400, 57600, 115200 bps
+UART Support: 8250, 16450, 16550, 16550A
+Data Format: 8 data bits, no parity, 1 stop bit (8N1)
+Flow Control: Hardware (RTS/CTS) or Software (XON/XOFF)
+FIFO Settings: 16550 FIFO enabled with 8-byte trigger
+Supported Ports: COM1-COM4 (3F8h, 2F8h, 3E8h, 2E8h)
+IRQ Support: IRQ 3, 4, 5, 7
+
+Parallel Mode:
+--------------
+PAR4 Mode: 4-bit nibble using standard SPP
+PAR8 Mode: 8-bit using EPP 1.7/1.9 or PS/2 bidirectional
+Supported Ports: LPT1-LPT3 (378h, 278h, 3BCh)
+IRQ Support: IRQ 7 (LPT1)
+
+Buffer Sizes:
+-------------
+Receive Buffer: 4096 bytes (circular)
+Transmit Buffer: 2048 bytes (queue)
+Frame Assembly Buffer: 528 bytes
+
+Memory Usage:
+-------------
+Conventional Memory: ~8KB (with UMB support)
+Upper Memory: ~32KB (if UMB available)
+Resident Size: Varies based on configuration
+
+Performance:
+------------
+Serial @115200 baud: ~10-11 KB/s effective throughput
+Serial @57600 baud: ~5-6 KB/s effective throughput
+Serial @38400 baud: ~3-4 KB/s effective throughput
+PAR8 (EPP): ~50-100 KB/s (hardware dependent)
+PAR4 (SPP): ~10-20 KB/s
+Latency: <10ms typical
+
+Escape Sequences:
+-----------------
+0xC0 (Frame delimiter) -> 0xDB 0xDC
+0xDB (Escape char)     -> 0xDB 0xDD
+0x11 (XON)             -> 0xDB 0xDE (XON mode only)
+0x13 (XOFF)            -> 0xDB 0xDF (XON mode only)
+
+ODI Support:
+------------
+LSL Version: 2.0 and higher
+MLID Functions: Reset, Shutdown, Get Statistics, Send Packet, Register RX
+Control Handler: Full implementation
+Multiplex ID: 0xC0A0
+
+
+================================================================================
+9. PERFORMANCE TIPS
+================================================================================
+
+1. Use 16550 UART for Serial Mode
+   - 16550 has 16-byte FIFO buffer reducing CPU overhead
+   - Allows reliable 115200 baud operation
+   - Available as inexpensive ISA add-in cards
+
+2. Use Hardware Flow Control
+   - More reliable than software flow control
+   - Lower CPU overhead
+   - Enables full 115200 baud speed
+
+3. Use Shorter Cables
+   - Keep cables under 10 feet (3 meters)
+   - Shorter cables = less signal degradation
+   - Especially important for high baud rates
+
+4. Load into Upper Memory Blocks
+   - Use DOS=HIGH,UMB in CONFIG.SYS
+   - Load memory managers (HIMEM, EMM386)
+   - Saves precious conventional memory
+
+5. Match Hardware Capabilities
+   - Don't use 115200 baud with 8250 UART
+   - Use 38400 or lower for 8250
+   - Match baud rate to cable quality
+
+6. Disable Unnecessary Features
+   - Close TSRs that poll serial/parallel ports
+   - Disable printer drivers when using parallel mode
+   - Minimize background processes
+
+7. For Gaming
+   - Use 115200 baud for lowest latency
+   - Hardware flow control recommended
+   - Short, high-quality cables essential
+
+8. For File Transfers
+   - Any baud rate works well
+   - Software flow control acceptable
+   - Can use longer cables at lower speeds
+
+
+================================================================================
+10. KNOWN LIMITATIONS
+================================================================================
+
+1. Point-to-Point Only
+   - Connects exactly two computers
+   - Cannot be used for multi-station networks
+   - No hub or bridge support
+
+2. No Packet Routing
+   - Direct connection only
+   - Cannot route to other networks
+   - IPX internal network required for some applications
+
+3. Serial Cable Length
+   - Practical limit: 50 feet at 9600 baud
+   - Practical limit: 10 feet at 115200 baud
+   - Exceeding limits causes errors
+
+4. IRQ Limitations
+   - Serial: IRQ 3, 4, 5, 7 only
+   - Parallel: IRQ 7 only
+   - No IRQ sharing support
+
+5. Parallel Mode Requirements
+   - PAR8 requires EPP or PS/2 bidirectional port
+   - Not all parallel ports support bidirectional mode
+   - Special cable required for PAR8
+
+6. Memory Requirements
+   - Requires ~32KB conventional memory without UMB
+   - Must have sufficient free conventional memory
+   - Cannot load if LSL not present
+
+7. Unload Restrictions
+   - Cannot unload while transfers active
+   - Must unload IPXODI before DCEMLID
+   - Cannot unload if network clients connected
+
+8. DOS Version
+   - UMB support requires DOS 5.0+
+   - Basic operation works on DOS 3.3+
+   - Some features unavailable on older DOS
+
+9. Single Instance
+   - Only one DCEMLID can load at a time
+   - Cannot use multiple serial/parallel connections simultaneously
+   - Use NETBIOS or other drivers for multiple links
+
+10. No Background Transfer
+    - Transfers only occur when applications send/receive
+    - No automatic keep-alive packets
+    - Connection monitoring is application-dependent
+
+
+================================================================================
+ADDITIONAL RESOURCES
+================================================================================
+
+Compatible Software:
+--------------------
+- Novell NetWare Client (NETX, VLM)
+- IPX-based games (Doom, Duke Nukem 3D, Warcraft, etc.)
+- LapLink (with ODI support)
+- Microsoft Network Client with IPX
+- Any ODI-compatible protocol stack
+
+Building Custom Cables:
+------------------------
+- DB9/DB25 connectors and hoods
+- 22-26 AWG stranded wire
+- Shielded cable recommended for high-speed
+- Solder connections for reliability
+- Heat shrink tubing for strain relief
+
+Alternative Drivers:
+--------------------
+- Null modem drivers: SLIPDIAL, EPPPKT
+- Parallel drivers: PLIP, DCC
+- Packet drivers: Available for many network cards
+
+For More Information:
+---------------------
+- Novell ODI Specification
+- IBM PC Serial Port Technical Reference
+- IEEE 1284 Parallel Port Standard (EPP)
+
+
+================================================================================
+VERSION HISTORY
+================================================================================
+
+Version 1.00 (January 2026)
+- Initial release
+- Serial mode with 8250/16550 support
+- Parallel PAR4 (4-bit SPP) mode
+- Parallel PAR8 (8-bit EPP/PS2) mode with auto-detection
+- Hardware and software flow control
+- CRC16-CCITT error detection
+- Automatic UMB loading
+- Full ODI MLID implementation
+
+
+================================================================================
+LICENSE AND WARRANTY
+================================================================================
+
+This software is provided "as is" without warranty of any kind, either
+expressed or implied. Use at your own risk.
+
+
+================================================================================
+CREDITS
+================================================================================
+
+DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection
+Implements point-to-point IPX networking over serial and parallel cables
+
+Based on:
+- Novell ODI Specification
+- SLIP (Serial Line Internet Protocol) framing
+- CRC16-CCITT error detection
+
+
+================================================================================
+END OF DOCUMENTATION
+================================================================================
