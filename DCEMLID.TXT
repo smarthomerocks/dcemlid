@@ -70,22 +70,39 @@ For Parallel Mode:
 3. INSTALLATION
 ================================================================================
 
+IMPORTANT: DCEMLID uses NET.CFG for configuration.
+           LSL reads NET.CFG and provides the configuration to the driver.
+
 Basic Installation Steps:
 --------------------------
 
-1. Ensure Novell LSL is loaded first:
+1. Create or edit NET.CFG file:
+
+   Edit C:\NWCLIENT\NET.CFG
+
+2. Add DCEMLID configuration section to NET.CFG:
+
+   Link Driver DCEMLID
+      PORT 3F8
+      INT 4
+      MODE SERIAL
+      BAUD 115200
+      FLOW RTS
+      NODE ADDRESS 02608C123456
+
+3. Load Novell LSL (which reads NET.CFG):
    
    C:\> LSL
 
-2. Load DCEMLID with desired options:
+4. Load DCEMLID driver:
    
-   C:\> DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+   C:\> DCEMLID
 
-3. Load IPX protocol stack:
+5. Load IPX protocol stack:
    
    C:\> IPXODI
 
-4. Verify installation:
+6. Verify installation:
    
    C:\> IPXODI S
    
@@ -97,88 +114,150 @@ Typical AUTOEXEC.BAT Configuration:
 @ECHO OFF
 CD \NWCLIENT
 LSL
-DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /FLOW=RTS
+DCEMLID
 IPXODI
 NETX
 CD \
+
+
+NET.CFG Configuration Format:
+------------------------------
+
+The NET.CFG file is a text file containing configuration for ODI drivers.
+Each driver has a "Link Driver" section with driver-specific keywords.
+
+Basic NET.CFG structure:
+
+   Link Driver DCEMLID
+      PORT 3F8
+      INT 4
+      MODE SERIAL
+      BAUD 115200
+      FLOW RTS
+      NODE ADDRESS 02608C123456
+
+For multiple instances (e.g., two serial connections), specify board numbers:
+
+   Link Driver DCEMLID 0
+      PORT 3F8
+      INT 4
+      MODE SERIAL
+      BAUD 115200
+      NODE ADDRESS 02608C111111
+
+   Link Driver DCEMLID 1
+      PORT 2F8
+      INT 3
+      MODE SERIAL
+      BAUD 57600
+      NODE ADDRESS 02608C222222
+
+Then load: DCEMLID 0 and DCEMLID 1
 
 
 ================================================================================
 4. CONFIGURATION OPTIONS
 ================================================================================
 
-Command Line Syntax:
---------------------
-DCEMLID [/MODE=mode] [/PORT=addr] [/BAUD=rate] [/FLOW=type] 
-        [/MAC=address] [/U] [/?]
+NET.CFG Keyword Reference:
+--------------------------
+
+DCEMLID configuration is specified in the NET.CFG file using a "Link Driver"
+section. All parameters are specified as keyword-value pairs.
+
+Section Header:
+   Link Driver DCEMLID [board_number]
+   
+   board_number: Optional board number (0-9) for multiple instances
+                 Default: 0
+
+Configuration Keywords:
+-----------------------
+
+PORT address
+   Sets the I/O port base address in hexadecimal.
+   
+   Serial ports:
+     3F8 - COM1 (default)
+     2F8 - COM2
+     3E8 - COM3
+     2E8 - COM4
+   
+   Parallel ports:
+     378 - LPT1 (default for parallel modes)
+     278 - LPT2
+     3BC - LPT3
+   
+   Example: PORT 3F8
+
+INT irq_number
+   Sets the IRQ number (decimal).
+   
+   Serial:
+     4 - COM1, COM3 (default for COM1)
+     3 - COM2, COM4
+   
+   Parallel:
+     7 - LPT1 (default)
+   
+   Example: INT 4
+   
+   Note: If not specified, driver auto-detects IRQ from port address.
+
+MODE mode_type
+   Selects connection mode.
+   
+   SERIAL - Serial port communication (default)
+   PAR4   - 4-bit nibble mode over standard parallel port
+   PAR8   - 8-bit mode using EPP or PS/2 bidirectional port
+   
+   Example: MODE SERIAL
+
+BAUD rate
+   Sets serial baud rate (decimal, serial mode only).
+   
+   Valid rates: 9600, 19200, 38400, 57600, 115200
+   Default: 115200
+   
+   Example: BAUD 115200
+   
+   Note: For 8250 UART, use 38400 or lower to avoid packet loss.
+
+FLOW flow_type
+   Sets flow control method (serial mode only).
+   
+   RTS - Hardware flow control using RTS/CTS lines (default)
+   XON - Software flow control using XON/XOFF characters
+   
+   Example: FLOW RTS
+   
+   Note: Hardware flow requires proper null-modem wiring.
+
+NODE ADDRESS mac_address
+   Sets the MAC address manually (12 hex digits, no separators).
+   
+   Format: NODE ADDRESS xxxxxxxxxxxx
+   Example: NODE ADDRESS 02608C123456
+   
+   Default: Random MAC generated from BIOS timer
+   
+   Note: Each computer must have a unique MAC address.
 
 
-Option Details:
----------------
+Command Line Options:
+---------------------
 
-/MODE=SERIAL|PAR4|PAR8
-  Selects connection mode.
-  
-  SERIAL - Serial port communication (default)
-  PAR4   - 4-bit nibble mode over standard parallel port
-  PAR8   - 8-bit mode using EPP or PS/2 bidirectional port
-  
-  Default: SERIAL
+DCEMLID [board_number] [/?] [/U]
 
-/PORT=addr
-  Sets the I/O port base address in hexadecimal.
-  
-  Serial ports:
-    3F8h - COM1 (default)
-    2F8h - COM2
-    3E8h - COM3
-    2E8h - COM4
-  
-  Parallel ports:
-    378h - LPT1 (default for parallel modes)
-    278h - LPT2
-    3BCh - LPT3
-  
-  Default: 3F8h (COM1) for serial, 378h (LPT1) for parallel
+board_number  - Board number to load (0-9), must match NET.CFG
+/?            - Display help screen with cable wiring diagrams
+/U            - Unload driver from memory
 
-/BAUD=rate
-  Sets serial baud rate (serial mode only).
-  
-  Valid rates: 9600, 19200, 38400, 57600, 115200
-  
-  Default: 115200
-  
-  Note: For 8250 UART, use 38400 or lower to avoid packet loss.
-
-/FLOW=RTS|XON
-  Sets flow control method (serial mode only).
-  
-  RTS - Hardware flow control using RTS/CTS lines (default)
-  XON - Software flow control using XON/XOFF characters
-  
-  Default: RTS
-  
-  Note: Hardware flow requires proper null-modem wiring.
-
-/MAC=xx-xx-xx-xx-xx-xx
-  Sets the MAC address manually.
-  
-  Format: Six hex bytes separated by hyphens
-  Example: /MAC=02-60-8C-12-34-56
-  
-  Default: Random MAC generated from BIOS timer
-  
-  Note: Each computer must have a unique MAC address.
-
-/U
-  Unloads the driver from memory.
-  
-  Example: DCEMLID /U
-  
-  Note: Driver must be idle (no active transfers) to unload.
-
-/?
-  Displays help screen with cable wiring diagrams.
+Examples:
+   DCEMLID          Load first instance (board 0)
+   DCEMLID 1        Load second instance (board 1)
+   DCEMLID /?       Show help
+   DCEMLID /U       Unload driver
 
 
 ================================================================================
@@ -187,14 +266,27 @@ Option Details:
 
 Example 1: Basic Serial Connection at Maximum Speed
 ----------------------------------------------------
-Computer A:
-  LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
-  IPXODI
+NET.CFG (Computer A):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+     FLOW RTS
+     NODE ADDRESS 02608C111111
 
-Computer B:
+NET.CFG (Computer B):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+     FLOW RTS
+     NODE ADDRESS 02608C222222
+
+Both computers:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  DCEMLID
   IPXODI
 
 Use: High-speed file transfers, multiplayer games
@@ -203,14 +295,27 @@ Cable: Hardware flow control null-modem
 
 Example 2: Serial Connection with Software Flow Control
 --------------------------------------------------------
-Computer A:
-  LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=57600 /FLOW=XON
-  IPXODI
+NET.CFG (Computer A):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 57600
+     FLOW XON
+     NODE ADDRESS 02608C111111
 
-Computer B:
+NET.CFG (Computer B):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 57600
+     FLOW XON
+     NODE ADDRESS 02608C222222
+
+Both computers:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=57600 /FLOW=XON
+  DCEMLID
   IPXODI
 
 Use: 3-wire null-modem cable (cheaper)
@@ -219,14 +324,25 @@ Cable: 3-wire null-modem (TXD, RXD, GND only)
 
 Example 3: Laptop Serial Connection (COM2)
 -------------------------------------------
-Laptop A:
-  LSL
-  DCEMLID /MODE=SERIAL /PORT=2F8 /BAUD=57600 /MAC=02-AA-BB-CC-DD-01
-  IPXODI
+NET.CFG (Laptop A):
+  Link Driver DCEMLID
+     PORT 2F8
+     INT 3
+     MODE SERIAL
+     BAUD 57600
+     NODE ADDRESS 02AABBCCDD01
 
-Laptop B:
+NET.CFG (Laptop B):
+  Link Driver DCEMLID
+     PORT 2F8
+     INT 3
+     MODE SERIAL
+     BAUD 57600
+     NODE ADDRESS 02AABBCCDD02
+
+Both laptops:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=2F8 /BAUD=57600 /MAC=02-AA-BB-CC-DD-02
+  DCEMLID
   IPXODI
 
 Use: Laptop-to-laptop file transfer
@@ -235,14 +351,21 @@ Note: Laptops often have only COM2 available
 
 Example 4: Parallel Connection (4-bit mode)
 --------------------------------------------
-Computer A:
-  LSL
-  DCEMLID /MODE=PAR4 /PORT=378
-  IPXODI
+NET.CFG (Computer A):
+  Link Driver DCEMLID
+     PORT 378
+     MODE PAR4
+     NODE ADDRESS 02608C111111
 
-Computer B:
+NET.CFG (Computer B):
+  Link Driver DCEMLID
+     PORT 378
+     MODE PAR4
+     NODE ADDRESS 02608C222222
+
+Both computers:
   LSL
-  DCEMLID /MODE=PAR4 /PORT=378
+  DCEMLID
   IPXODI
 
 Use: Systems without serial ports or with IRQ conflicts
@@ -251,14 +374,21 @@ Cable: Standard parallel printer cable (bidirectional)
 
 Example 5: Parallel Connection (8-bit EPP mode)
 ------------------------------------------------
-Computer A:
-  LSL
-  DCEMLID /MODE=PAR8 /PORT=378
-  IPXODI
+NET.CFG (Computer A):
+  Link Driver DCEMLID
+     PORT 378
+     MODE PAR8
+     NODE ADDRESS 02608C111111
 
-Computer B:
+NET.CFG (Computer B):
+  Link Driver DCEMLID
+     PORT 378
+     MODE PAR8
+     NODE ADDRESS 02608C222222
+
+Both computers:
   LSL
-  DCEMLID /MODE=PAR8 /PORT=378
+  DCEMLID
   IPXODI
 
 Use: Fastest parallel transfer with EPP-capable ports
@@ -268,14 +398,17 @@ Note: Driver auto-detects EPP and falls back to PS/2 mode if unavailable
 
 Example 6: Old PC with 8250 UART
 ---------------------------------
-Computer A (8250):
-  LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=38400
-  IPXODI
+NET.CFG (both computers):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 38400
+     NODE ADDRESS (unique per machine)
 
-Computer B (16550):
+Both computers:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=38400
+  DCEMLID
   IPXODI
 
 Use: Reliable connection on old hardware
@@ -284,15 +417,31 @@ Note: Driver warns when 8250 is used with baud >= 57600
 
 Example 7: NetWare Client Connection
 -------------------------------------
-Computer A (Server):
+NET.CFG (Server):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+     NODE ADDRESS 020000000001
+
+NET.CFG (Client):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+     NODE ADDRESS 020000000002
+
+Server:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /MAC=02-00-00-00-00-01
+  DCEMLID
   IPXODI
   [Run NetWare server software]
 
-Computer B (Client):
+Client:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200 /MAC=02-00-00-00-00-02
+  DCEMLID
   IPXODI
   NETX
   F:
@@ -303,23 +452,58 @@ Use: Access NetWare file server over direct cable
 
 Example 8: Doom/Duke Nukem 3D Multiplayer
 ------------------------------------------
-Computer A:
-  LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
-  IPXODI
-  DOOM -nodes 2 -port 0x869
+NET.CFG (Computer A):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
 
-Computer B:
+NET.CFG (Computer B):
+  Link Driver DCEMLID
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+
+Both computers:
   LSL
-  DCEMLID /MODE=SERIAL /PORT=3F8 /BAUD=115200
+  DCEMLID
   IPXODI
   DOOM -nodes 2 -port 0x869
 
 Use: IPX multiplayer gaming
 
 
-Example 9: Unloading the Driver
---------------------------------
+Example 9: Multiple Serial Connections (Two Ports)
+---------------------------------------------------
+NET.CFG (Computer with 2 serial ports):
+  Link Driver DCEMLID 0
+     PORT 3F8
+     INT 4
+     MODE SERIAL
+     BAUD 115200
+     NODE ADDRESS 02608C111111
+
+  Link Driver DCEMLID 1
+     PORT 2F8
+     INT 3
+     MODE SERIAL
+     BAUD 115200
+     NODE ADDRESS 02608C222222
+
+Load both instances:
+  LSL
+  DCEMLID 0
+  DCEMLID 1
+  IPXODI
+
+Use: Connect to two different computers simultaneously
+Note: Requires sufficient memory and no IRQ conflicts
+
+
+Example 10: Unloading the Driver
+---------------------------------
 To unload DCEMLID after use:
 
   NETX /U          (unload NetWare client if loaded)
@@ -328,6 +512,10 @@ To unload DCEMLID after use:
   LSL /U           (unload LSL)
 
 Note: Unload in reverse order of loading
+
+For multiple instances:
+  DCEMLID 1 /U
+  DCEMLID 0 /U
 
 
 ================================================================================
@@ -430,8 +618,17 @@ Problem: "ERROR: LSL not loaded"
 Solution: Load LSL.COM before DCEMLID. Check that LSL.COM is in your path.
 
 
+Problem: "ERROR: No configuration in NET.CFG"
+Solution: 
+  - Create NET.CFG file in LSL directory (usually C:\NWCLIENT\NET.CFG)
+  - Add "Link Driver DCEMLID" section with required keywords
+  - Ensure NET.CFG is readable and not corrupted
+  - Check that LSL can find NET.CFG (set PATH if needed)
+
+
 Problem: "ERROR: Driver already loaded"
 Solution: Unload existing driver with DCEMLID /U, or reboot.
+         For multiple instances, ensure unique board numbers.
 
 
 Problem: "ERROR: IRQ conflict detected"
@@ -662,10 +859,12 @@ Multiplex ID: 0xC0A0
    - Basic operation works on DOS 3.3+
    - Some features unavailable on older DOS
 
-9. Single Instance
-   - Only one DCEMLID can load at a time
-   - Cannot use multiple serial/parallel connections simultaneously
-   - Use NETBIOS or other drivers for multiple links
+9. Multiple Instances
+   - Each board number (0-9) can only be loaded once
+   - Use different board numbers for multiple connections
+   - Maximum 10 instances can run simultaneously (if hardware allows)
+   - Each instance requires unique port, IRQ, and MAC address
+   - Sufficient memory required for multiple instances
 
 10. No Background Transfer
     - Transfers only occur when applications send/receive

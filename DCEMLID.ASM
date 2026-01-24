@@ -13,12 +13,13 @@
 ; Driver Information
 DRIVER_NAME     DB 'DCEMLID',0
 DRIVER_VERSION  EQU 0100h               ; Version 1.00
-MTU_SIZE        EQU 512                 ; Maximum Transmission Unit
+MTU_SIZE        EQU 576                 ; Maximum Transmission Unit (IPX max)
 
 ; Multiplex and LSL Constants
 MULTIPLEX_ID    EQU 0C0A0h              ; Our multiplex ID
 LSL_CHECK       EQU 0C000h              ; Check if LSL loaded
 LSL_REGISTER    EQU 0C001h              ; Register MLID with LSL
+LSL_GET_CONFIG  EQU 0C003h              ; Get configuration from LSL
 
 ; Frame Protocol Constants
 FRAME_START     EQU 0C0h                ; SLIP-style frame delimiter
@@ -85,6 +86,29 @@ MLID_GET_STATS  EQU 05h
 MLID_SEND_PKT   EQU 06h
 MLID_REG_RX     EQU 07h
 
+; ECB (Event Control Block) Structure Offsets
+ECB_Link        EQU 0                   ; DD - Link to next ECB
+ECB_ESR         EQU 4                   ; DD - Event Service Routine
+ECB_InUse       EQU 8                   ; DB - In use flag
+ECB_CompCode    EQU 9                   ; DB - Completion code
+ECB_Socket      EQU 10                  ; DW - Socket number
+ECB_IPXWork     EQU 12                  ; 4 bytes - IPX workspace
+ECB_DriverWork  EQU 16                  ; 12 bytes - Driver workspace
+ECB_ImmAddr     EQU 28                  ; 6 bytes - Immediate address
+ECB_FragCount   EQU 34                  ; DW - Fragment count
+ECB_FragList    EQU 36                  ; Fragment descriptors start
+
+; Fragment Descriptor Offsets (each 6 bytes)
+FRAG_Addr       EQU 0                   ; DD - Fragment address
+FRAG_Size       EQU 4                   ; DW - Fragment size
+
+; ECB Completion Codes
+ECB_SUCCESS     EQU 00h                 ; Successful
+ECB_CANCELLED   EQU 0FCh                ; Cancelled by application
+ECB_HARDWARE    EQU 0FDh                ; Hardware error
+ECB_BAD_PKT     EQU 0FEh                ; Malformed packet
+ECB_OVERFLOW    EQU 0FFh                ; Packet overflow
+
 ;=============================================================================
 ; Data Segment
 ;=============================================================================
@@ -101,6 +125,7 @@ Config STRUC
     IRQNum      DB 0                    ; IRQ number
     UARTType    DB 0                    ; 0=8250, 1=16550
     ParMode     DB 0                    ; For PAR8: 0=EPP, 1=PS/2
+    BoardNum    DW 0                    ; Board number for multiple instances
 Config ENDS
 
 CfgData Config <>
@@ -137,6 +162,19 @@ TxPending       DB 0                    ; TX in progress flag
 TxRetryCount    DB 0                    ; Current retry count
 TxTimeout       DW 0                    ; Timeout counter
 
+; ECB Queue Management
+TxQueueHead     DD 0                    ; Head of transmit ECB queue
+TxQueueTail     DD 0                    ; Tail of transmit ECB queue
+TxQueueCount    DW 0                    ; Number of ECBs in queue
+TxCurrentECB    DD 0                    ; Currently transmitting ECB
+TxCurrentSeg    DW 0                    ; Segment of current ECB
+TxCurrentOff    DW 0                    ; Offset of current ECB
+TxFragIndex     DW 0                    ; Current fragment index
+TxFragOffset    DW 0                    ; Offset within current fragment
+TxTotalSent     DW 0                    ; Total bytes sent in current packet
+TxPacketSize    DW 0                    ; Total packet size
+TxCRC           DW 0FFFFh               ; Transmit CRC
+
 ; Receive State
 RxSeqNum        DB 0                    ; Expected RX sequence number
 RxState         DB 0                    ; Frame parser FSM state
@@ -148,7 +186,21 @@ RxCRC           DW 0FFFFh               ; Running CRC calculation
 ; Buffers
 RxBuffer        DB RX_BUFFER_SIZE DUP(0)
 TxBuffer        DB TX_BUFFER_SIZE DUP(0)
-FrameBuffer     DB MTU_SIZE+16 DUP(0)   ; Temp frame assembly buffer
+FrameBuffer     DB MTU_SIZE+32 DUP(0)   ; Temp frame assembly buffer (extra for headers)
+TxFrameBuffer   DB MTU_SIZE+32 DUP(0)   ; Transmit frame assembly buffer
+
+; LSL Configuration Keywords
+CfgKeyMode      DB 'MODE',0
+CfgKeyPort      DB 'PORT',0
+CfgKeyInt       DB 'INT',0
+CfgKeyBaud      DB 'BAUD',0
+CfgKeyFlow      DB 'FLOW',0
+CfgKeyNode      DB 'NODE',0
+CfgValSerial    DB 'SERIAL',0
+CfgValPar4      DB 'PAR4',0
+CfgValPar8      DB 'PAR8',0
+CfgValRTS       DB 'RTS',0
+CfgValXON       DB 'XON',0
 
 ; Messages
 MsgBanner       DB 'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10,'$'
@@ -171,6 +223,7 @@ MsgWarn8250     DB 'WARNING: 8250 UART at high baud - packet loss may occur.',13
                 DB '         Consider using 38400 or lower.',13,10,'$'
 
 MsgErrLSL       DB 'ERROR: LSL not loaded. Load LSL.COM first.',13,10,'$'
+MsgErrConfig    DB 'ERROR: No configuration in NET.CFG. Add Link Driver DCEMLID section.',13,10,'$'
 MsgErrLoaded    DB 'ERROR: Driver already loaded.',13,10,'$'
 MsgErrIRQ       DB 'ERROR: IRQ conflict detected.',13,10,'$'
 MsgErrPort      DB 'ERROR: Hardware not detected at specified port.',13,10,'$'
@@ -182,18 +235,18 @@ MsgErrBusy      DB 'ERROR: Driver busy, cannot unload.',13,10,'$'
 
 ; Help Screen
 HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10
-                DB 13,10,'Usage: DCEMLID [options]',13,10
-                DB 13,10,'Options:',13,10
-                DB '  /MODE=SERIAL|PAR4|PAR8   Connection mode (default: SERIAL)',13,10
-                DB '  /PORT=addr               I/O port address in hex',13,10
-                DB '                           Serial: 3F8,2F8,2E8,3E8 (default: 3F8)',13,10
-                DB '                           Parallel: 378,278,3BC (default: 378)',13,10
-                DB '  /BAUD=rate               Serial baud rate (default: 115200)',13,10
-                DB '                           Valid: 9600,19200,38400,57600,115200',13,10
-                DB '  /FLOW=RTS|XON            Flow control (default: RTS)',13,10
-                DB '  /MAC=xx-xx-xx-xx-xx-xx   MAC address (default: random)',13,10
-                DB '  /U                       Unload driver',13,10
-                DB '  /?                       Display this help',13,10
+                DB 13,10,'Usage: DCEMLID',13,10
+                DB 13,10,'Configuration is read from NET.CFG. Example:',13,10
+                DB 13,10,'  Link Driver DCEMLID',13,10
+                DB '     PORT 3F8',13,10
+                DB '     INT 4',13,10
+                DB '     MODE SERIAL',13,10
+                DB '     BAUD 115200',13,10
+                DB '     FLOW RTS',13,10
+                DB '     NODE ADDRESS 02608C123456',13,10
+                DB 13,10,'For multiple instances, specify board number:',13,10
+                DB '  Link Driver DCEMLID 0',13,10
+                DB '  Link Driver DCEMLID 1',13,10
                 DB 13,10,'Serial Null-Modem Cable Wiring (DB9):',13,10
                 DB '  Hardware flow control:',13,10
                 DB '    Pin 2 (RXD) -------- Pin 3 (TXD)',13,10
@@ -210,21 +263,9 @@ HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Conne
                 DB '  8-bit mode: Use EPP-capable cable or PS/2 bidirectional',13,10
                 DB 13,10,'$'
 
-; Command Line Parameter Strings
-OptMode         DB '/MODE=',0
-OptPort         DB '/PORT=',0
-OptBaud         DB '/BAUD=',0
-OptFlow         DB '/FLOW=',0
-OptMAC          DB '/MAC=',0
+; Command Line Options (only help and unload)
 OptUnload       DB '/U',0
 OptHelp         DB '/?',0
-
-ModeSerial      DB 'SERIAL',0
-ModePar4        DB 'PAR4',0
-ModePar8        DB 'PAR8',0
-
-FlowRTS         DB 'RTS',0
-FlowXON         DB 'XON',0
 
 ; Baud Rate Table (divisor values for 115200 base)
 BaudTable:
@@ -252,8 +293,8 @@ Start:
     mov     ah, 09h
     int     21h
 
-    ; Parse command line
-    call    ParseCommandLine
+    ; Get configuration from LSL/NET.CFG
+    call    GetConfigFromLSL
     jc      ExitError
 
     ; Check for help option
@@ -287,171 +328,445 @@ ShowHelp:
     int     21h
 
 ;=============================================================================
-; ParseCommandLine - Parse and validate command line parameters
-; Input: PSP command line at DS:0080h
+; GetConfigFromLSL - Retrieve configuration from LSL/NET.CFG
+; Input: None
 ; Output: CF=1 on error, CF=0 on success
 ;=============================================================================
 
 CmdHelp         DB 0
 CmdUnload       DB 0
 
-ParseCommandLine PROC
+GetConfigFromLSL PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
     push    si
     push    di
+    push    es
 
     ; Initialize defaults
     mov     CfgData.Mode, 0             ; Serial
     mov     CfgData.Port, 3F8h          ; COM1
     mov     CfgData.BaudRate, 115200
     mov     CfgData.FlowCtrl, 0         ; RTS/CTS
+    mov     CfgData.BoardNum, 0         ; First instance
     
-    ; Generate random MAC from BIOS timer
+    ; Generate random MAC from BIOS timer (may be overridden)
     call    GenerateRandomMAC
 
-    ; Get command line from PSP
-    mov     si, 80h                     ; PSP command line length
+    ; Get board number from command line if specified
+    mov     si, 80h
     xor     cx, cx
-    mov     cl, [si]                    ; Length of command line
-    inc     si                          ; Point to actual command line
-    jcxz    ParseDone                   ; No parameters
-
-ParseLoop:
+    mov     cl, [si]
+    inc     si
+    jcxz    NoBoardNum
+    
     ; Skip spaces
     call    SkipSpaces
-    jcxz    ParseDone
-
-    ; Check for each option
-    lea     di, OptHelp
-    call    CompareOption
-    je      ParseHelp
-
-    lea     di, OptUnload
-    call    CompareOption
-    je      ParseUnload
-
-    lea     di, OptMode
-    call    CompareOption
-    je      ParseMode
-
-    lea     di, OptPort
-    call    CompareOption
-    je      ParsePort
-
-    lea     di, OptBaud
-    call    CompareOption
-    je      ParseBaud
-
-    lea     di, OptFlow
-    call    CompareOption
-    je      ParseFlow
-
-    lea     di, OptMAC
-    call    CompareOption
-    je      ParseMAC
-
-    ; Unknown option, skip to next
-    call    SkipToSpace
-    jmp     ParseLoop
-
-ParseHelp:
-    mov     CmdHelp, 1
-    jmp     ParseDone
-
-ParseUnload:
-    mov     CmdUnload, 1
-    jmp     ParseDone
-
-ParseMode:
-    ; Parse mode value
-    lea     di, ModeSerial
-    call    CompareValue
-    je      ParseModeSerial
+    jcxz    NoBoardNum
     
-    lea     di, ModePar4
-    call    CompareValue
-    je      ParseModePar4
-    
-    lea     di, ModePar8
-    call    CompareValue
-    je      ParseModePar8
-    
-    jmp     ParseLoop
-
-ParseModeSerial:
-    mov     CfgData.Mode, 0
-    jmp     ParseLoop
-
-ParseModePar4:
-    mov     CfgData.Mode, 1
-    mov     CfgData.Port, 378h          ; LPT1 default
-    jmp     ParseLoop
-
-ParseModePar8:
-    mov     CfgData.Mode, 2
-    mov     CfgData.Port, 378h          ; LPT1 default
-    jmp     ParseLoop
-
-ParsePort:
-    ; Parse hex port value
-    call    ParseHexWord
-    jc      ParseLoop
-    mov     CfgData.Port, ax
-    jmp     ParseLoop
-
-ParseBaud:
-    ; Parse decimal baud rate
-    call    ParseDecWord
-    jc      ParseLoop
-    mov     CfgData.BaudRate, ax
-    jmp     ParseLoop
-
-ParseFlow:
-    ; Parse flow control
-    lea     di, FlowRTS
-    call    CompareValue
-    je      ParseFlowRTS
-    
-    lea     di, FlowXON
-    call    CompareValue
-    je      ParseFlowXON
-    
-    jmp     ParseLoop
-
-ParseFlowRTS:
-    mov     CfgData.FlowCtrl, 0
-    jmp     ParseLoop
-
-ParseFlowXON:
-    mov     CfgData.FlowCtrl, 1
-    jmp     ParseLoop
-
-ParseMAC:
-    ; Parse MAC address (format: XX-XX-XX-XX-XX-XX)
-    lea     di, CfgData.MacAddr
-    mov     bx, 6
-ParseMACLoop:
-    call    ParseHexByte
-    jc      ParseLoop
-    stosb
-    dec     bx
-    jz      ParseMACDone
-    
-    ; Skip delimiter
-    cmp     byte ptr [si], '-'
-    jne     ParseMACLoop
+    ; Check for /? or /U
+    cmp     byte ptr [si], '/'
+    jne     ParseBoardNum
     inc     si
     dec     cx
-    jmp     ParseMACLoop
+    cmp     byte ptr [si], '?'
+    je      ShowHelpFlag
+    cmp     byte ptr [si], 'U'
+    je      UnloadFlag
+    cmp     byte ptr [si], 'u'
+    je      UnloadFlag
+    jmp     NoBoardNum
 
-ParseMACDone:
-    jmp     ParseLoop
+ShowHelpFlag:
+    mov     CmdHelp, 1
+    jmp     ConfigDone
 
-ParseDone:
+UnloadFlag:
+    mov     CmdUnload, 1
+    jmp     ConfigDone
+
+ParseBoardNum:
+    ; Parse board number (0-9)
+    mov     al, [si]
+    cmp     al, '0'
+    jb      NoBoardNum
+    cmp     al, '9'
+    ja      NoBoardNum
+    sub     al, '0'
+    xor     ah, ah
+    mov     CfgData.BoardNum, ax
+
+NoBoardNum:
+    ; Call LSL to get configuration
+    ; AX = LSL_GET_CONFIG (0xC003)
+    ; BX = Board number
+    ; ES:SI = Driver name
+    mov     ax, LSL_GET_CONFIG
+    mov     bx, CfgData.BoardNum
+    push    ds
+    pop     es
+    lea     si, DRIVER_NAME
+    int     2Fh
+    
+    ; Check if configuration found
+    cmp     al, 0
+    jne     NoConfig
+    
+    ; ES:SI now points to configuration block from NET.CFG
+    ; Parse configuration keywords
+    call    ParseLSLConfig
+    jc      ConfigError
+
+ConfigDone:
+    clc
+    pop     es
+    pop     di
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+
+NoConfig:
+    ; No configuration in NET.CFG, use defaults
+    clc
+    jmp     ConfigDone
+
+ConfigError:
+    stc
+    pop     es
+    pop     di
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+GetConfigFromLSL ENDP
+
+;=============================================================================
+; ParseLSLConfig - Parse LSL configuration block
+; Input: ES:SI = configuration string from LSL
+; Output: CF=1 on error, CF=0 on success
+;=============================================================================
+
+ParseLSLConfig PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+    push    di
+
+ParseLSLLoop:
+    ; Check for end of configuration
+    mov     al, es:[si]
+    test    al, al
+    jz      ParseLSLDone
+    
+    ; Skip spaces
+SkipLSLSpaces:
+    cmp     byte ptr es:[si], ' '
+    jne     NotSpace
+    inc     si
+    jmp     SkipLSLSpaces
+NotSpace:
+    
+    ; Check for PORT keyword
+    lea     di, CfgKeyPort
+    call    CompareLSLKeyword
+    je      ParseLSLPort
+    
+    ; Check for INT keyword
+    lea     di, CfgKeyInt
+    call    CompareLSLKeyword
+    je      ParseLSLInt
+    
+    ; Check for MODE keyword
+    lea     di, CfgKeyMode
+    call    CompareLSLKeyword
+    je      ParseLSLMode
+    
+    ; Check for BAUD keyword
+    lea     di, CfgKeyBaud
+    call    CompareLSLKeyword
+    je      ParseLSLBaud
+    
+    ; Check for FLOW keyword
+    lea     di, CfgKeyFlow
+    call    CompareLSLKeyword
+    je      ParseLSLFlow
+    
+    ; Check for NODE keyword
+    lea     di, CfgKeyNode
+    call    CompareLSLKeyword
+    je      ParseLSLNode
+    
+    ; Unknown keyword, skip to end of line
+    call    SkipToLSLEOL
+    jmp     ParseLSLLoop
+
+ParseLSLPort:
+    call    ParseLSLHexValue
+    jc      ParseLSLLoop
+    mov     CfgData.Port, ax
+    jmp     ParseLSLLoop
+
+ParseLSLInt:
+    call    ParseLSLDecValue
+    jc      ParseLSLLoop
+    mov     CfgData.IRQNum, al
+    jmp     ParseLSLLoop
+
+ParseLSLMode:
+    lea     di, CfgValSerial
+    call    CompareLSLValue
+    je      SetModeSerial
+    lea     di, CfgValPar4
+    call    CompareLSLValue
+    je      SetModePar4
+    lea     di, CfgValPar8
+    call    CompareLSLValue
+    je      SetModePar8
+    jmp     ParseLSLLoop
+
+SetModeSerial:
+    mov     CfgData.Mode, 0
+    jmp     ParseLSLLoop
+
+SetModePar4:
+    mov     CfgData.Mode, 1
+    mov     CfgData.Port, 378h          ; Default LPT1
+    jmp     ParseLSLLoop
+
+SetModePar8:
+    mov     CfgData.Mode, 2
+    mov     CfgData.Port, 378h          ; Default LPT1
+    jmp     ParseLSLLoop
+
+ParseLSLBaud:
+    call    ParseLSLDecValue
+    jc      ParseLSLLoop
+    mov     CfgData.BaudRate, ax
+    jmp     ParseLSLLoop
+
+ParseLSLFlow:
+    lea     di, CfgValRTS
+    call    CompareLSLValue
+    je      SetFlowRTS
+    lea     di, CfgValXON
+    call    CompareLSLValue
+    je      SetFlowXON
+    jmp     ParseLSLLoop
+
+SetFlowRTS:
+    mov     CfgData.FlowCtrl, 0
+    jmp     ParseLSLLoop
+
+SetFlowXON:
+    mov     CfgData.FlowCtrl, 1
+    jmp     ParseLSLLoop
+
+ParseLSLNode:
+    ; Parse NODE ADDRESS xxxxxxxxxxxx (12 hex digits)
+    ; Skip "ADDRESS" keyword
+    call    SkipLSLWord
+    ; Parse 12 hex digits for MAC address
+    lea     di, CfgData.MacAddr
+    mov     cx, 6
+ParseLSLNodeLoop:
+    call    ParseLSLHexByte
+    jc      ParseLSLLoop
+    stosb
+    loop    ParseLSLNodeLoop
+    jmp     ParseLSLLoop
+
+ParseLSLDone:
     clc
     pop     di
     pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
     ret
-ParseCommandLine ENDP
+ParseLSLConfig ENDP
+
+; Helper: Compare keyword at ES:SI with DS:DI
+CompareLSLKeyword PROC
+    push    si
+    push    di
+CompLSLKeyLoop:
+    mov     al, [di]
+    test    al, al
+    jz      CompLSLKeyMatch
+    mov     ah, es:[si]
+    call    ToUpper
+    xchg    al, ah
+    call    ToUpper
+    cmp     al, ah
+    jne     CompLSLKeyNoMatch
+    inc     si
+    inc     di
+    jmp     CompLSLKeyLoop
+CompLSLKeyMatch:
+    pop     di
+    pop     si
+    ; Advance SI past keyword
+    add     si, di
+    sub     si, offset CfgKeyMode
+    xor     al, al              ; Set ZF
+    ret
+CompLSLKeyNoMatch:
+    pop     di
+    pop     si
+    or      al, 1               ; Clear ZF
+    ret
+CompareLSLKeyword ENDP
+
+; Helper: Compare value at ES:SI with DS:DI
+CompareLSLValue PROC
+    push    si
+    push    di
+CompLSLValLoop:
+    mov     al, [di]
+    test    al, al
+    jz      CompLSLValMatch
+    mov     ah, es:[si]
+    cmp     ah, ' '
+    je      CompLSLValMatch
+    cmp     ah, 13
+    je      CompLSLValMatch
+    cmp     ah, 10
+    je      CompLSLValMatch
+    call    ToUpper
+    xchg    al, ah
+    call    ToUpper
+    cmp     al, ah
+    jne     CompLSLValNoMatch
+    inc     si
+    inc     di
+    jmp     CompLSLValLoop
+CompLSLValMatch:
+    pop     di
+    pop     si
+    add     si, di
+    sub     si, offset CfgValSerial
+    xor     al, al
+    ret
+CompLSLValNoMatch:
+    pop     di
+    pop     si
+    or      al, 1
+    ret
+CompareLSLValue ENDP
+
+; Helper: Parse hex value from ES:SI
+ParseLSLHexValue PROC
+    push    bx
+    xor     bx, bx
+    mov     cx, 4
+ParseLSLHexLoop:
+    mov     al, es:[si]
+    call    HexDigitToValue
+    jc      ParseLSLHexDone
+    shl     bx, 4
+    or      bl, al
+    inc     si
+    loop    ParseLSLHexLoop
+ParseLSLHexDone:
+    mov     ax, bx
+    clc
+    pop     bx
+    ret
+ParseLSLHexValue ENDP
+
+; Helper: Parse decimal value from ES:SI
+ParseLSLDecValue PROC
+    push    bx
+    push    dx
+    xor     bx, bx
+ParseLSLDecLoop:
+    mov     al, es:[si]
+    cmp     al, '0'
+    jb      ParseLSLDecDone
+    cmp     al, '9'
+    ja      ParseLSLDecDone
+    sub     al, '0'
+    mov     dx, 10
+    push    ax
+    mov     ax, bx
+    mul     dx
+    mov     bx, ax
+    pop     ax
+    add     bx, ax
+    inc     si
+    jmp     ParseLSLDecLoop
+ParseLSLDecDone:
+    mov     ax, bx
+    clc
+    pop     dx
+    pop     bx
+    ret
+ParseLSLDecValue ENDP
+
+; Helper: Parse hex byte from ES:SI
+ParseLSLHexByte PROC
+    push    bx
+    xor     ah, ah
+    mov     bl, 2
+ParseLSLHexByteLoop:
+    mov     al, es:[si]
+    call    HexDigitToValue
+    jc      ParseLSLHexByteDone
+    shl     ah, 4
+    or      ah, al
+    inc     si
+    dec     bl
+    jnz     ParseLSLHexByteLoop
+ParseLSLHexByteDone:
+    mov     al, ah
+    clc
+    pop     bx
+    ret
+ParseLSLHexByte ENDP
+
+; Helper: Skip to end of line
+SkipToLSLEOL PROC
+SkipLSLEOLLoop:
+    mov     al, es:[si]
+    cmp     al, 13
+    je      SkipLSLEOLDone
+    cmp     al, 10
+    je      SkipLSLEOLDone
+    test    al, al
+    jz      SkipLSLEOLDone
+    inc     si
+    jmp     SkipLSLEOLLoop
+SkipLSLEOLDone:
+    ret
+SkipToLSLEOL ENDP
+
+; Helper: Skip one word
+SkipLSLWord PROC
+SkipLSLWordLoop:
+    mov     al, es:[si]
+    cmp     al, ' '
+    je      SkipLSLWordDone
+    cmp     al, 13
+    je      SkipLSLWordDone
+    cmp     al, 10
+    je      SkipLSLWordDone
+    test    al, al
+    jz      SkipLSLWordDone
+    inc     si
+    jmp     SkipLSLWordLoop
+SkipLSLWordDone:
+    ret
+SkipLSLWord ENDP
 
 ;=============================================================================
 ; Helper Procedures for Command Line Parsing
@@ -478,86 +793,6 @@ SkipToSpaceLoop:
 SkipToSpaceDone:
     ret
 SkipToSpace ENDP
-
-CompareOption PROC
-    ; Compare string at SI with string at DI (case insensitive)
-    ; Preserves SI, CX
-    push    si
-    push    cx
-CompOptLoop:
-    mov     al, [di]
-    test    al, al
-    jz      CompOptMatch
-    mov     ah, [si]
-    
-    ; Convert to uppercase
-    call    ToUpper
-    xchg    al, ah
-    call    ToUpper
-    
-    cmp     al, ah
-    jne     CompOptNoMatch
-    
-    inc     si
-    inc     di
-    dec     cx
-    jnz     CompOptLoop
-
-CompOptNoMatch:
-    pop     cx
-    pop     si
-    test    al, al              ; Clear ZF
-    ret
-
-CompOptMatch:
-    pop     cx
-    pop     si
-    add     si, di              ; Advance SI
-    sub     si, offset OptHelp  ; Adjust for starting position
-    sub     cx, di
-    add     cx, offset OptHelp
-    xor     al, al              ; Set ZF
-    ret
-CompareOption ENDP
-
-CompareValue PROC
-    ; Similar to CompareOption but for values after '='
-    push    si
-    push    cx
-CompValLoop:
-    mov     al, [di]
-    test    al, al
-    jz      CompValMatch
-    mov     ah, [si]
-    
-    call    ToUpper
-    xchg    al, ah
-    call    ToUpper
-    
-    cmp     al, ah
-    jne     CompValNoMatch
-    
-    inc     si
-    inc     di
-    dec     cx
-    jnz     CompValLoop
-
-CompValNoMatch:
-    pop     cx
-    pop     si
-    test    al, al
-    ret
-
-CompValMatch:
-    pop     cx
-    pop     si
-    add     si, di
-    sub     si, offset ModeSerial
-    sub     cx, di
-    add     cx, offset ModeSerial
-    xor     al, al
-    ret
-CompareValue ENDP
 
 ToUpper PROC
     ; Convert AL to uppercase
@@ -1194,6 +1429,10 @@ RegisterWithLSL PROC
     push    dx
     push    es
 
+    ; Set board number from configuration
+    mov     ax, CfgData.BoardNum
+    mov     MLIDConfigTable.BoardNumber, ax
+
     ; Fill in configuration table
     lea     si, CfgData.MacAddr
     lea     di, MLIDConfigTable.BoardNodeAddr
@@ -1287,8 +1526,49 @@ SerialISR PROC FAR
     mov     dx, CfgData.Port
     in      al, dx
     
+    ; Check for ACK
+    cmp     al, ACK_CHAR
+    je      HandleACK
+    
     ; Process received byte through frame parser
     call    ProcessReceivedByte
+    jmp     SerialNotReceive
+
+HandleACK:
+    ; Read sequence number
+    mov     dx, CfgData.Port
+    push    ax
+WaitForSeq:
+    add     dx, UART_LSR
+    in      al, dx
+    test    al, 01h                 ; Data ready?
+    jz      WaitForSeq
+    sub     dx, UART_LSR
+    in      al, dx                  ; Read sequence number
+    
+    ; Check if it matches current transmission
+    cmp     al, byte ptr TxFrameBuffer
+    jne     ACKMismatch
+    
+    ; ACK received, complete current ECB successfully
+    push    es
+    push    si
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      NoCurrentECB
+    cmp     word ptr TxCurrentECB+2, 0
+    je      NoCurrentECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    call    CompleteTransmitECB
+NoCurrentECB:
+    pop     si
+    pop     es
+    
+    ; Start next transmission
+    call    StartNextTransmit
+    
+ACKMismatch:
+    pop     ax
 
 SerialNotReceive:
     ; Send EOI to PIC
@@ -1574,14 +1854,50 @@ ValidateFrame ENDP
 ;=============================================================================
 
 DeliverFrameToLSL PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    ds
+    push    es
+    push    si
+    push    di
+
     ; Check if receive handler is registered
     cmp     RxHandlerOff, 0
+    jne     HasHandler
+    cmp     RxHandlerSeg, 0
     je      NoRxHandler
 
+HasHandler:
+    ; Set up for LSL call
+    ; LSL expects:
+    ; ES:SI = packet data
+    ; CX = packet length
+    ; AX = protocol ID (for us, always 0 - let LSL demux)
+    
+    mov     ax, @data
+    mov     es, ax
+    lea     si, FrameBuffer+3       ; Skip seq + length header
+    mov     cx, RxFrameLen
+    xor     ax, ax                  ; Protocol ID = 0
+    
     ; Call LSL receive handler
-    ; (Simplified - actual implementation needs proper ECB handling)
+    ; The handler will allocate ECB and copy data
+    push    ds
+    mov     ds, RxHandlerSeg
+    call    dword ptr [RxHandlerOff]
+    pop     ds
     
 NoRxHandler:
+    pop     di
+    pop     si
+    pop     es
+    pop     ds
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
     ret
 DeliverFrameToLSL ENDP
 
@@ -1636,9 +1952,535 @@ MLIDReceiveHandler PROC FAR
 MLIDReceiveHandler ENDP
 
 MLIDTransmitHandler PROC FAR
-    ; Stub - actual implementation handles ECB
-    ret
+    ; ES:SI = ECB to send
+    ; Called by IPX to queue a packet for transmission
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    ds
+    push    es
+    push    si
+    push    di
+
+    ; Set up data segment
+    mov     ax, @data
+    mov     ds, ax
+
+    ; Mark ECB as in use
+    mov     byte ptr es:[si+ECB_InUse], 0FFh
+
+    ; Add ECB to transmit queue
+    call    QueueTransmitECB
+
+    ; Start transmission if not already transmitting
+    cmp     TxPending, 0
+    jne     TxAlreadyActive
+    call    StartNextTransmit
+
+TxAlreadyActive:
+    pop     di
+    pop     si
+    pop     es
+    pop     ds
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    retf
 MLIDTransmitHandler ENDP
+
+;=============================================================================
+; QueueTransmitECB - Add ECB to transmit queue
+; Input: ES:SI = ECB address
+;=============================================================================
+
+QueueTransmitECB PROC
+    push    ax
+    push    bx
+
+    ; Clear the link field (this will be last in queue)
+    mov     word ptr es:[si+ECB_Link], 0
+    mov     word ptr es:[si+ECB_Link+2], 0
+
+    ; Check if queue is empty
+    cmp     word ptr TxQueueHead, 0
+    jne     QueueNotEmpty
+    cmp     word ptr TxQueueHead+2, 0
+    jne     QueueNotEmpty
+
+    ; Queue is empty, this is first ECB
+    mov     word ptr TxQueueHead, si
+    mov     word ptr TxQueueHead+2, es
+    mov     word ptr TxQueueTail, si
+    mov     word ptr TxQueueTail+2, es
+    mov     TxQueueCount, 1
+    jmp     QueueDone
+
+QueueNotEmpty:
+    ; Add to tail of queue
+    push    es
+    push    si
+    
+    ; Load tail ECB
+    les     si, dword ptr TxQueueTail
+    
+    ; Get new ECB from stack
+    pop     bx                      ; New offset
+    pop     ax                      ; New segment
+    
+    ; Link tail to new ECB
+    mov     word ptr es:[si+ECB_Link], bx
+    mov     word ptr es:[si+ECB_Link+2], ax
+    
+    ; Update tail pointer
+    mov     word ptr TxQueueTail, bx
+    mov     word ptr TxQueueTail+2, ax
+    inc     TxQueueCount
+
+QueueDone:
+    pop     bx
+    pop     ax
+    ret
+QueueTransmitECB ENDP
+
+;=============================================================================
+; StartNextTransmit - Begin transmitting next queued ECB
+;=============================================================================
+
+StartNextTransmit PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    es
+    push    si
+
+    ; Check if queue is empty
+    cmp     word ptr TxQueueHead, 0
+    jne     HasPacket
+    cmp     word ptr TxQueueHead+2, 0
+    je      NoPacket
+
+HasPacket:
+    ; Load ECB from queue head
+    les     si, dword ptr TxQueueHead
+    
+    ; Save current ECB
+    mov     word ptr TxCurrentECB, si
+    mov     word ptr TxCurrentECB+2, es
+    mov     TxCurrentSeg, es
+    mov     TxCurrentOff, si
+
+    ; Build packet frame from ECB fragments
+    call    BuildTransmitFrame
+    jc      TransmitError
+
+    ; Start transmitting the frame
+    call    TransmitFrame
+
+    ; Mark as transmitting
+    mov     TxPending, 1
+    mov     TxRetryCount, 0
+
+    jmp     StartDone
+
+TransmitError:
+    ; Complete ECB with error
+    les     si, dword ptr TxCurrentECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_HARDWARE
+    call    CompleteTransmitECB
+    
+    ; Try next packet
+    call    StartNextTransmit
+
+NoPacket:
+StartDone:
+    pop     si
+    pop     es
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+StartNextTransmit ENDP
+
+;=============================================================================
+; BuildTransmitFrame - Build frame from ECB fragments
+; Input: ES:SI = ECB
+; Output: TxFrameBuffer contains frame, TxPacketSize = size, CF=1 on error
+;=============================================================================
+
+BuildTransmitFrame PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    ds
+    push    es
+    push    si
+    push    di
+
+    ; Set up destination (TxFrameBuffer)
+    mov     ax, @data
+    mov     ds, ax
+    lea     di, TxFrameBuffer
+    
+    ; Add frame header: sequence number + length (filled later)
+    mov     al, TxSeqNum
+    stosb
+    inc     TxSeqNum
+    
+    ; Save position for length field
+    push    di
+    add     di, 2                   ; Reserve 2 bytes for length
+    
+    ; Get fragment count
+    mov     cx, es:[si+ECB_FragCount]
+    test    cx, cx
+    jz      BuildError
+    
+    ; Point to fragment list
+    add     si, ECB_FragList
+    
+    xor     bx, bx                  ; Total size counter
+    
+BuildFragLoop:
+    push    cx
+    
+    ; Load fragment address and size
+    mov     ax, word ptr es:[si+FRAG_Addr]
+    mov     dx, word ptr es:[si+FRAG_Addr+2]
+    mov     cx, es:[si+FRAG_Size]
+    
+    ; Check for reasonable size
+    test    cx, cx
+    jz      BuildFragNext
+    cmp     cx, MTU_SIZE
+    ja      BuildError
+    
+    ; Add to total
+    add     bx, cx
+    cmp     bx, MTU_SIZE
+    ja      BuildError
+    
+    ; Copy fragment data
+    push    es
+    push    si
+    
+    mov     si, ax
+    mov     es, dx
+    
+    ; ES:SI = source, DS:DI = dest, CX = count
+    push    ds
+    pop     ax
+    mov     ds, dx
+    push    ax
+    pop     es
+    
+    rep     movsb
+    
+    ; Restore
+    pop     si
+    pop     es
+    
+    mov     ax, @data
+    mov     ds, ax
+    
+BuildFragNext:
+    add     si, 6                   ; Next fragment descriptor
+    pop     cx
+    loop    BuildFragLoop
+    
+    ; Store total packet size
+    mov     TxPacketSize, bx
+    
+    ; Fill in length field
+    pop     di                      ; Position after seq num
+    mov     ax, @data
+    mov     es, ax
+    mov     ax, bx
+    stosw                           ; Store length
+    
+    clc
+    jmp     BuildDone
+    
+BuildError:
+    pop     di                      ; Clean up stack
+    stc
+    
+BuildDone:
+    pop     di
+    pop     si
+    pop     es
+    pop     ds
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+BuildTransmitFrame ENDP
+
+;=============================================================================
+; TransmitFrame - Send frame with escaping and CRC
+; Input: TxFrameBuffer contains frame, TxPacketSize = size
+;=============================================================================
+
+TransmitFrame PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+
+    ; Calculate CRC for frame
+    lea     si, TxFrameBuffer
+    mov     cx, TxPacketSize
+    add     cx, 3                   ; Include seq + length
+    call    CalculateFrameCRC
+    
+    ; Send frame start delimiter
+    mov     al, FRAME_START
+    call    SendByte
+    
+    ; Send frame with escaping
+    lea     si, TxFrameBuffer
+    mov     cx, TxPacketSize
+    add     cx, 3                   ; Include seq + length
+    
+TransmitLoop:
+    lodsb
+    call    SendByteWithEscape
+    loop    TransmitLoop
+    
+    ; Send CRC
+    mov     ax, word ptr TxCRC
+    call    SendByteWithEscape      ; Send low byte
+    mov     al, ah
+    call    SendByteWithEscape      ; Send high byte
+    
+    ; Send frame end delimiter
+    mov     al, FRAME_START
+    call    SendByte
+    
+    ; Update statistics
+    inc     dword ptr Statistics.TxPackets
+    mov     ax, TxPacketSize
+    add     word ptr Statistics.TxBytes, ax
+    adc     word ptr Statistics.TxBytes+2, 0
+    
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+TransmitFrame ENDP
+
+;=============================================================================
+; SendByteWithEscape - Send byte with SLIP escaping
+; Input: AL = byte to send
+;=============================================================================
+
+SendByteWithEscape PROC
+    push    ax
+    
+    cmp     al, FRAME_START
+    je      EscapeStart
+    cmp     al, FRAME_ESC
+    je      EscapeESC
+    
+    ; Check flow control mode for XON/XOFF escaping
+    cmp     CfgData.FlowCtrl, 1
+    jne     SendNormal
+    
+    cmp     al, XON_CHAR
+    je      EscapeXON
+    cmp     al, XOFF_CHAR
+    je      EscapeXOFF
+    
+SendNormal:
+    call    SendByte
+    jmp     SendEscDone
+    
+EscapeStart:
+    mov     al, FRAME_ESC
+    call    SendByte
+    mov     al, ESC_START
+    call    SendByte
+    jmp     SendEscDone
+    
+EscapeESC:
+    mov     al, FRAME_ESC
+    call    SendByte
+    mov     al, ESC_ESC
+    call    SendByte
+    jmp     SendEscDone
+    
+EscapeXON:
+    mov     al, FRAME_ESC
+    call    SendByte
+    mov     al, ESC_XON
+    call    SendByte
+    jmp     SendEscDone
+    
+EscapeXOFF:
+    mov     al, FRAME_ESC
+    call    SendByte
+    mov     al, ESC_XOFF
+    call    SendByte
+    
+SendEscDone:
+    pop     ax
+    ret
+SendByteWithEscape ENDP
+
+;=============================================================================
+; SendByte - Send single byte to serial port
+; Input: AL = byte
+;=============================================================================
+
+SendByte PROC
+    push    ax
+    push    dx
+    
+    mov     ah, al
+    mov     dx, CfgData.Port
+    
+    ; Wait for transmitter ready
+SendWait:
+    push    dx
+    add     dx, UART_LSR
+    in      al, dx
+    test    al, 20h
+    pop     dx
+    jz      SendWait
+    
+    ; Send byte
+    mov     al, ah
+    out     dx, al
+    
+    pop     dx
+    pop     ax
+    ret
+SendByte ENDP
+
+;=============================================================================
+; CalculateFrameCRC - Calculate CRC16 for frame
+; Input: DS:SI = data, CX = length
+; Output: TxCRC = calculated CRC
+;=============================================================================
+
+CalculateFrameCRC PROC
+    push    ax
+    push    bx
+    push    cx
+    push    si
+    
+    mov     word ptr TxCRC, 0FFFFh
+    
+CalcCRCLoop:
+    lodsb
+    call    UpdateTxCRC
+    loop    CalcCRCLoop
+    
+    pop     si
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+CalculateFrameCRC ENDP
+
+;=============================================================================
+; UpdateTxCRC - Update transmit CRC with one byte
+; Input: AL = byte
+;=============================================================================
+
+UpdateTxCRC PROC
+    push    ax
+    push    bx
+    push    cx
+    
+    xor     ah, ah
+    mov     bx, word ptr TxCRC
+    xor     bl, al
+    xor     bh, bh
+    shl     bx, 1
+    mov     cx, word ptr CRCTable[bx]
+    mov     ax, word ptr TxCRC
+    shr     ax, 8
+    xor     ax, cx
+    mov     word ptr TxCRC, ax
+    
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+UpdateTxCRC ENDP
+
+;=============================================================================
+; CompleteTransmitECB - Complete ECB and remove from queue
+; Input: ES:SI = ECB, CompCode already set
+;=============================================================================
+
+CompleteTransmitECB PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    ds
+    push    es
+    push    si
+    push    di
+    
+    mov     ax, @data
+    mov     ds, ax
+    
+    ; Remove from queue head
+    mov     ax, word ptr es:[si+ECB_Link]
+    mov     dx, word ptr es:[si+ECB_Link+2]
+    mov     word ptr TxQueueHead, ax
+    mov     word ptr TxQueueHead+2, dx
+    
+    ; Update count
+    dec     TxQueueCount
+    jnz     QueueStillHasItems
+    
+    ; Queue is now empty, clear tail too
+    mov     word ptr TxQueueTail, 0
+    mov     word ptr TxQueueTail+2, 0
+    
+QueueStillHasItems:
+    ; Clear ECB in use flag
+    mov     byte ptr es:[si+ECB_InUse], 0
+    
+    ; Check if there's an ESR (Event Service Routine)
+    cmp     word ptr es:[si+ECB_ESR], 0
+    jne     HasESR
+    cmp     word ptr es:[si+ECB_ESR+2], 0
+    je      NoESR
+    
+HasESR:
+    ; Call the ESR
+    ; ES:SI already points to ECB
+    call    dword ptr es:[si+ECB_ESR]
+    
+NoESR:
+    ; Clear current ECB
+    mov     word ptr TxCurrentECB, 0
+    mov     word ptr TxCurrentECB+2, 0
+    mov     TxPending, 0
+    
+    pop     di
+    pop     si
+    pop     es
+    pop     ds
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+CompleteTransmitECB ENDP
 
 MLIDControlHandler PROC FAR
     ; AL = function code
@@ -1685,8 +2527,31 @@ DoGetStats:
     retf
 
 DoSendPacket:
-    ; Queue packet for transmission
-    ; Implementation needed
+    ; ES:SI = ECB to send
+    ; This is called directly by control handler
+    ; Queue the ECB
+    push    ax
+    push    bx
+    push    ds
+    
+    mov     ax, @data
+    mov     ds, ax
+    
+    ; Mark ECB as in use
+    mov     byte ptr es:[si+ECB_InUse], 0FFh
+    
+    ; Queue it
+    call    QueueTransmitECB
+    
+    ; Start transmission if idle
+    cmp     TxPending, 0
+    jne     SendPktBusy
+    call    StartNextTransmit
+    
+SendPktBusy:
+    pop     ds
+    pop     bx
+    pop     ax
     retf
 
 DoRegisterRx:
