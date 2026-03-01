@@ -21,12 +21,13 @@ TABLE OF CONTENTS
 
 DOS/Windows with Borland TASM:
 -------------------------------
-  C:\> TASM /m2 DCEMLID.ASM
+  C:\> TASM /m2 /jJUMPS DCEMLID.ASM
   C:\> TLINK /t DCEMLID.OBJ
-  C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+
+Note: TLINK /t directly creates .COM file - no EXE2BIN needed.
 
 Or with Make:
-  C:\> MAKE dos
+  C:\> MAKE
 
 Linux with DOSBox:
 ------------------
@@ -43,9 +44,8 @@ Linux with NASM (requires syntax conversion):
 
 Required Software:
 ------------------
-- Borland Turbo Assembler (TASM) 3.0 or higher
-- Borland Turbo Link (TLINK) 3.0 or higher
-- EXE2BIN.EXE (included with DOS or Borland tools)
+- Borland Turbo Assembler (TASM) 4.1 or higher (5.0 recommended)
+- Borland Turbo Link (TLINK) 4.0 or higher
 
 Alternative: Microsoft MASM 5.0 or higher also works
 
@@ -89,7 +89,6 @@ Option C: Turbo Assembler 3.0 (Minimal)
 2. Extract files:
    - TASM.EXE
    - TLINK.EXE
-   - EXE2BIN.EXE (or use DOS version)
 
 3. Place in C:\BIN or C:\DOS
 
@@ -101,7 +100,7 @@ Option C: Turbo Assembler 3.0 (Minimal)
 
 Method 1: Manual Command Line
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-C:\> TASM /m2 DCEMLID.ASM
+C:\> TASM /m2 /jJUMPS DCEMLID.ASM
      Turbo Assembler  Version 5.0
      Copyright (c) 1988, 1996 Borland International
      
@@ -114,18 +113,18 @@ C:\> TLINK /t DCEMLID.OBJ
      Copyright (c) 1992, 1996 Borland International
      ...
 
-C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+The .COM file is created directly by TLINK /t.
 
 
 Method 2: Using Make
 ~~~~~~~~~~~~~~~~~~~~~
 If you have Borland Make:
 
-C:\> MAKE -f Makefile dos
+C:\> MAKE
 
 Or Turbo Make:
 
-C:\> MAKER dos
+C:\> MAKER
 
 
 Method 3: Batch File
@@ -134,11 +133,9 @@ Create BUILD.BAT:
 
 @ECHO OFF
 ECHO Building DCEMLID...
-TASM /m2 /zi DCEMLID.ASM
+TASM /m2 /jJUMPS DCEMLID.ASM
 IF ERRORLEVEL 1 GOTO ERROR
 TLINK /t /x DCEMLID.OBJ
-IF ERRORLEVEL 1 GOTO ERROR
-EXE2BIN DCEMLID.EXE DCEMLID.COM
 IF ERRORLEVEL 1 GOTO ERROR
 ECHO Build successful!
 GOTO END
@@ -154,21 +151,21 @@ C:\> BUILD
 ------------------------------
 
 TASM Flags:
-  /m2       - Enable multiple passes (required for 286+ instructions)
+  /m2       - Enable multiple passes (required for forward references)
+  /jJUMPS   - Enable automatic jump sizing (REQUIRED for 8086 compatibility)
   /zi       - Include debug information
   /l        - Generate listing file (DCEMLID.LST)
   /w2       - Enable all warnings
   /c        - Case-sensitive labels
-  /jJUMPS   - Enable automatic jump sizing
 
 TLINK Flags:
-  /t        - Create .COM file format
+  /t        - Create .COM file format directly (no EXE2BIN needed)
   /x        - No map file
   /v        - Include debug information
   /l        - Include line numbers in map
 
 Recommended for production:
-  TASM /m2 DCEMLID.ASM
+  TASM /m2 /jJUMPS DCEMLID.ASM
   TLINK /t /x DCEMLID.OBJ
 
 
@@ -178,8 +175,9 @@ Recommended for production:
 If you have Microsoft MASM instead of TASM:
 
 C:\> MASM /Zi DCEMLID.ASM;
-C:\> LINK DCEMLID.OBJ;
-C:\> EXE2BIN DCEMLID.EXE DCEMLID.COM
+C:\> LINK /t DCEMLID.OBJ;
+
+Note: LINK /t directly creates .COM files.
 
 MASM Flags:
   /Zi       - Debug information
@@ -221,8 +219,6 @@ Step 2: Install Borland TASM in DOSBox
 3. Copy TASM files to ~/dos/tasm/:
    - TASM.EXE
    - TLINK.EXE
-   - EXE2BIN.EXE
-   - TASM.EXE (and support files)
 
 4. Copy DCEMLID.ASM to ~/dos/project/
 
@@ -246,7 +242,7 @@ cd \project
 Step 4: Build
 ~~~~~~~~~~~~~
 $ cd ~/dos/project
-$ dosbox -conf ../build.conf -c "tasm /m2 dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exe2bin dcemlid.exe dcemlid.com" -c "exit"
+$ dosbox -conf ../build.conf -c "tasm /m2 /jJUMPS dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exit"
 
 Or use the Makefile:
 $ make dosbox
@@ -283,9 +279,8 @@ Step 3: Copy Tools
 
 Step 4: Build
 ~~~~~~~~~~~~~
-  $ dosemu -E "TASM /m2 DCEMLID.ASM"
+  $ dosemu -E "TASM /m2 /jJUMPS DCEMLID.ASM"
   $ dosemu -E "TLINK /t DCEMLID.OBJ"
-  $ dosemu -E "EXE2BIN DCEMLID.EXE DCEMLID.COM"
 
 Result in ~/.dosemu/drive_c/DCEMLID.COM
 
@@ -313,7 +308,7 @@ NASM uses different syntax than TASM. Key differences:
 TASM:                      NASM:
 -----                      -----
 .MODEL SMALL               (not needed)
-.286                       [CPU 286]
+.8086                      [CPU 8086]
 .DATA                      section .data
 .CODE                      section .text
 STRUC                      struc
@@ -379,7 +374,7 @@ Step 2: Setup Build Environment
 Step 3: Create build.bat in C:\DOS\PROJECT
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 @echo off
-"C:\Program Files (x86)\DOSBox-0.74\dosbox.exe" -c "mount c c:\dos" -c "c:" -c "path=c:\tasm" -c "cd \project" -c "tasm /m2 dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exe2bin dcemlid.exe dcemlid.com" -c "exit"
+"C:\Program Files (x86)\DOSBox-0.74\dosbox.exe" -c "mount c c:\dos" -c "c:" -c "path=c:\tasm" -c "cd \project" -c "tasm /m2 /jJUMPS dcemlid.asm" -c "tlink /t dcemlid.obj" -c "exit"
 
 Step 4: Build
 ~~~~~~~~~~~~~
@@ -469,8 +464,8 @@ Problem: "This program cannot be run in DOS mode"
 --------------------------------------------------
 Solution:
   - You have .EXE instead of .COM
-  - Run EXE2BIN to convert
-  - Or use TLINK /t flag
+  - Make sure to use TLINK /t flag (creates .COM directly)
+  - Rebuild with: TLINK /t DCEMLID.OBJ
 
 
 Problem: Build succeeds but driver doesn't work
@@ -499,7 +494,7 @@ Solution:
 
 For debugging with Turbo Debugger (TD):
 
-  TASM /m2 /zi /l DCEMLID.ASM
+  TASM /m2 /zi /l /jJUMPS DCEMLID.ASM
   TLINK /t /v DCEMLID.OBJ
   TD DCEMLID.COM
 
@@ -511,9 +506,8 @@ The /zi and /v flags include symbol information.
 
 For smallest, fastest code:
 
-  TASM /m2 /ml DCEMLID.ASM
+  TASM /m2 /ml /jJUMPS DCEMLID.ASM
   TLINK /t /x DCEMLID.OBJ
-  EXE2BIN DCEMLID.EXE DCEMLID.COM
 
 The /ml flag enables all optimizations.
 
@@ -523,7 +517,7 @@ The /ml flag enables all optimizations.
 
 To generate assembly listing:
 
-  TASM /m2 /l DCEMLID.ASM
+  TASM /m2 /l /jJUMPS DCEMLID.ASM
 
 Creates DCEMLID.LST with:
   - Source code
@@ -550,7 +544,7 @@ Creates DCEMLID.MAP with:
 
 To enable/disable features during build:
 
-  TASM /m2 /dDEBUG=1 DCEMLID.ASM
+  TASM /m2 /jJUMPS /dDEBUG=1 DCEMLID.ASM
 
 Then in source:
   IFDEF DEBUG
@@ -561,7 +555,7 @@ Then in source:
 6.6 Cross-Reference Generation
 -------------------------------
 
-  TASM /m2 /c /l DCEMLID.ASM
+  TASM /m2 /c /l /jJUMPS DCEMLID.ASM
 
 The /c flag adds cross-references to listing.
 
@@ -571,11 +565,11 @@ The /c flag adds cross-references to listing.
 
 Create different versions:
 
-  TASM /m2 /dSERIAL_ONLY=1 DCEMLID.ASM
+  TASM /m2 /jJUMPS /dSERIAL_ONLY=1 DCEMLID.ASM
   TLINK /t DCEMLID.OBJ
   REN DCEMLID.COM DCESER.COM
 
-  TASM /m2 /dPARALLEL_ONLY=1 DCEMLID.ASM  
+  TASM /m2 /jJUMPS /dPARALLEL_ONLY=1 DCEMLID.ASM  
   TLINK /t DCEMLID.OBJ
   REN DCEMLID.COM DCEPAR.COM
 

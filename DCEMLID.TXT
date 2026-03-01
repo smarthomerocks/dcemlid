@@ -48,9 +48,9 @@ Key Features:
 ================================================================================
 
 Minimum Requirements:
-  - IBM PC/XT/AT or compatible
+  - IBM PC/XT or compatible
   - DOS 3.3 or higher (DOS 5.0+ recommended for UMB support)
-  - 8088/8086 CPU or higher
+  - 8086 CPU or higher (original IBM PC and all compatibles)
   - 32KB free conventional memory (or 8KB with UMB)
   - Novell LSL.COM loaded before DCEMLID
 

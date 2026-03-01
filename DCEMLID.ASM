@@ -1,17 +1,21 @@
 ; DCEMLID.ASM - ODI MLID Driver for Serial/Parallel Direct Cable Connection
 ; Implements point-to-point IPX networking over null-modem or parallel cables
 ; Supports configurable MAC, baud rates, flow control, and automatic UMB loading
+; 8086 CPU compatible (runs on IBM PC/XT and all compatibles)
 
-.MODEL SMALL
-.286
-.STACK 100h
+; Build as .COM file with: TASM /m2 /jJUMPS DCEMLID.ASM && TLINK /t DCEMLID.OBJ
+
+.8086                           ; 8086 CPU instructions only
+
+CODE    SEGMENT
+        ASSUME CS:CODE, DS:CODE, ES:CODE, SS:CODE
+        ORG 100h                ; .COM file starts at offset 100h
 
 ;=============================================================================
 ; Constants and Equates
 ;=============================================================================
 
 ; Driver Information
-DRIVER_NAME     DB 'DCEMLID',0
 DRIVER_VERSION  EQU 0100h               ; Version 1.00
 MTU_SIZE        EQU 576                 ; Maximum Transmission Unit (IPX max)
 
@@ -110,16 +114,24 @@ ECB_BAD_PKT     EQU 0FEh                ; Malformed packet
 ECB_OVERFLOW    EQU 0FFh                ; Packet overflow
 
 ;=============================================================================
-; Data Segment
+; Entry Point - Jump over data section
 ;=============================================================================
 
-.DATA
+Start:
+        jmp     Main            ; Skip over data section to main code
+
+;=============================================================================
+; Data Section (embedded in code segment for .COM file)
+;=============================================================================
+
+; Driver Information
+DRIVER_NAME     DB 'DCEMLID',0
 
 ; Configuration Parameters
 Config STRUC
     Mode        DB 0                    ; 0=Serial, 1=PAR4, 2=PAR8
     Port        DW 3F8h                 ; I/O port base address
-    BaudRate    DW 115200               ; Baud rate (serial only)
+    BaudRate    DD 115200               ; Baud rate (serial only)
     FlowCtrl    DB 0                    ; 0=RTS/CTS, 1=XON/XOFF
     MacAddr     DB 6 DUP(0)             ; MAC address
     IRQNum      DB 0                    ; IRQ number
@@ -147,14 +159,14 @@ Statistics Stats <>
 ; Driver State
 DriverLoaded    DB 0                    ; Flag: driver loaded
 DriverActive    DB 0                    ; Flag: driver active (not idle)
-RxHandlerSeg    DW 0                    ; LSL receive handler segment
 RxHandlerOff    DW 0                    ; LSL receive handler offset
+RxHandlerSeg    DW 0                    ; LSL receive handler segment
 
-; Interrupt Vectors
-OldInt2F_Seg    DW 0
+; Interrupt Vectors (Off then Seg for correct FAR JMP dword ptr)
 OldInt2F_Off    DW 0
-OldHwInt_Seg    DW 0
+OldInt2F_Seg    DW 0
 OldHwInt_Off    DW 0
+OldHwInt_Seg    DW 0
 
 ; Transmit State
 TxSeqNum        DB 0                    ; Current TX sequence number
@@ -268,25 +280,27 @@ OptUnload       DB '/U',0
 OptHelp         DB '/?',0
 
 ; Baud Rate Table (divisor values for 115200 base)
+BaudTableSize EQU 5                  ; Number of baud rate entries
 BaudTable:
-    DW 9600, 12              ; 115200 / 12 = 9600
-    DW 19200, 6              ; 115200 / 6 = 19200
-    DW 38400, 3              ; 115200 / 3 = 38400
-    DW 57600, 2              ; 115200 / 2 = 57600
-    DW 115200, 1             ; 115200 / 1 = 115200
-    DW 0                     ; End marker
-BaudTableSize EQU ($ - BaudTable) / 4 - 1
+    DD 9600
+    DW 12                    ; 115200 / 12 = 9600
+    DD 19200
+    DW 6                     ; 115200 / 6 = 19200
+    DD 38400
+    DW 3                     ; 115200 / 3 = 38400
+    DD 57600
+    DW 2                     ; 115200 / 2 = 57600
+    DD 115200
+    DW 1                     ; 115200 / 1 = 115200
+    DD 0                     ; End marker
 
 ;=============================================================================
-; Code Segment
+; Main Code Section
 ;=============================================================================
 
-.CODE
-
-Start:
-    mov     ax, @data
-    mov     ds, ax
-    mov     es, ax
+Main:
+        ; All segment registers already point to CS in .COM file
+        ; (DOS sets CS=DS=ES=SS before running .COM)
 
     ; Display banner
     lea     dx, MsgBanner
@@ -313,7 +327,8 @@ Start:
     mov     ax, 3100h           ; TSR with return code 0
     mov     dx, ResidentSize
     add     dx, 15
-    shr     dx, 4               ; Convert bytes to paragraphs
+    mov     cl, 4
+    shr     dx, cl              ; Convert bytes to paragraphs
     int     21h
 
 ExitError:
@@ -348,7 +363,8 @@ GetConfigFromLSL PROC
     ; Initialize defaults
     mov     CfgData.Mode, 0             ; Serial
     mov     CfgData.Port, 3F8h          ; COM1
-    mov     CfgData.BaudRate, 115200
+    mov     word ptr CfgData.BaudRate, 0C200h     ; 115200 low word
+    mov     word ptr CfgData.BaudRate+2, 1        ; 115200 high word
     mov     CfgData.FlowCtrl, 0         ; RTS/CTS
     mov     CfgData.BoardNum, 0         ; First instance
     
@@ -550,7 +566,8 @@ SetModePar8:
 ParseLSLBaud:
     call    ParseLSLDecValue
     jc      ParseLSLLoop
-    mov     CfgData.BaudRate, ax
+    mov     word ptr CfgData.BaudRate, ax
+    mov     word ptr CfgData.BaudRate+2, 0
     jmp     ParseLSLLoop
 
 ParseLSLFlow:
@@ -673,7 +690,8 @@ ParseLSLHexLoop:
     mov     al, es:[si]
     call    HexDigitToValue
     jc      ParseLSLHexDone
-    shl     bx, 4
+    mov     cl, 4
+    shl     bx, cl
     or      bl, al
     inc     si
     loop    ParseLSLHexLoop
@@ -722,7 +740,8 @@ ParseLSLHexByteLoop:
     mov     al, es:[si]
     call    HexDigitToValue
     jc      ParseLSLHexByteDone
-    shl     ah, 4
+    mov     cl, 4
+    shl     ah, cl
     or      ah, al
     inc     si
     dec     bl
@@ -818,7 +837,10 @@ ParseHexLoop:
     call    HexDigitToValue
     jc      ParseHexDone
     
-    shl     bx, 4
+    push    cx              ; Save outer loop counter
+    mov     cl, 4
+    shl     bx, cl
+    pop     cx              ; Restore outer loop counter
     or      bl, al
     inc     si
     dec     cx
@@ -843,7 +865,10 @@ ParseHexByteLoop:
     call    HexDigitToValue
     jc      ParseHexByteDone
     
-    shl     ah, 4
+    push    cx              ; Save outer loop counter
+    mov     cl, 4
+    shl     ah, cl
+    pop     cx              ; Restore outer loop counter
     or      ah, al
     inc     si
     dec     cx
@@ -1048,10 +1073,11 @@ InitError:
     cmp     OldInt2F_Off, 0
     je      InitErrorNoRestore
     
+    ; Load both offset and segment BEFORE changing DS
+    mov     dx, OldInt2F_Off
     push    ds
     mov     ax, OldInt2F_Seg
     mov     ds, ax
-    mov     dx, OldInt2F_Off
     mov     ax, 252Fh
     int     21h
     pop     ds
@@ -1072,7 +1098,27 @@ InstallDriver ENDP
 InitSerialPort PROC
     push    dx
     push    ax
+    push    cx
 
+    mov     dx, CfgData.Port
+
+    ; === UART Detection using scratch register test ===
+    ; The scratch register (offset 7) can be written and read back
+    ; If no UART present, we'll read 0xFF (floating bus)
+    add     dx, UART_SCR        ; Scratch register
+    mov     al, 055h            ; Test pattern 1
+    out     dx, al
+    in      al, dx
+    cmp     al, 055h
+    jne     NoUARTFound
+    
+    mov     al, 0AAh            ; Test pattern 2
+    out     dx, al
+    in      al, dx
+    cmp     al, 0AAh
+    jne     NoUARTFound
+    
+    ; UART detected, continue with initialization
     mov     dx, CfgData.Port
 
     ; Detect 8250 vs 16550
@@ -1089,8 +1135,8 @@ InitSerialPort PROC
     ; It's an 8250
     mov     CfgData.UARTType, 0
     
-    ; Check if baud rate is too high for 8250
-    cmp     CfgData.BaudRate, 57600
+    ; Check if baud rate is too high for 8250 (compare low word, high word is 0 for valid rates)
+    cmp     word ptr CfgData.BaudRate, 57600
     jb      UARTTypeOK
     
     ; Print warning
@@ -1105,16 +1151,14 @@ Is16550:
     mov     CfgData.UARTType, 1
 
 UARTTypeOK:
-    ; Calculate divisor for baud rate
-    mov     ax, 115200
-    xor     dx, dx
-    div     CfgData.BaudRate
-    mov     bx, ax              ; Save divisor in BX
+    ; Look up divisor for baud rate from table (8086-compatible)
+    call    LookupBaudDivisor
+    ; BX now contains the divisor
 
     ; Set DLAB to access divisor latch
     mov     dx, CfgData.Port
     add     dx, UART_LCR
-    mov     al, LCR_DLAB | LCR_8N1
+    mov     al, LCR_DLAB OR LCR_8N1
     out     dx, al
 
     ; Set divisor
@@ -1137,14 +1181,14 @@ UARTTypeOK:
     
     mov     dx, CfgData.Port
     add     dx, UART_FCR
-    mov     al, FCR_ENABLE | FCR_CLEAR | FCR_TRIGGER_8
+    mov     al, FCR_ENABLE OR FCR_CLEAR OR FCR_TRIGGER_8
     out     dx, al
 
 NoFIFO:
     ; Configure modem control
     mov     dx, CfgData.Port
     add     dx, UART_MCR
-    mov     al, MCR_DTR | MCR_RTS | MCR_OUT2
+    mov     al, MCR_DTR OR MCR_RTS OR MCR_OUT2
     out     dx, al
 
     ; Enable interrupts
@@ -1174,6 +1218,15 @@ SerialIRQ3:
 
 SerialIRQSet:
     clc
+    pop     cx
+    pop     ax
+    pop     dx
+    ret
+
+NoUARTFound:
+    ; No UART detected at this port
+    stc
+    pop     cx
     pop     ax
     pop     dx
     ret
@@ -1187,8 +1240,25 @@ InitSerialPort ENDP
 InitParallelPort PROC
     push    dx
     push    ax
+    push    cx
 
     mov     dx, CfgData.Port
+
+    ; === Parallel port detection using data register test ===
+    ; Write test patterns and read back
+    mov     al, 055h
+    out     dx, al
+    in      al, dx
+    cmp     al, 055h
+    jne     NoLPTFound
+    
+    mov     al, 0AAh
+    out     dx, al
+    in      al, dx
+    cmp     al, 0AAh
+    jne     NoLPTFound
+    
+    ; Parallel port detected, continue with initialization
 
     ; Check for PAR8 mode
     cmp     CfgData.Mode, 2
@@ -1197,7 +1267,8 @@ InitParallelPort PROC
     ; Try to detect EPP capability
     add     dx, LPT_ECR
     in      al, dx
-    shr     al, 5               ; Get bits 5-7
+    mov     cl, 5
+    shr     al, cl              ; Get bits 5-7
     cmp     al, 001b            ; EPP 1.7
     je      HasEPP
     cmp     al, 010b            ; EPP 1.9
@@ -1219,7 +1290,7 @@ ParallelConfigDone:
     ; Initialize control register
     mov     dx, CfgData.Port
     add     dx, LPT_CONTROL
-    mov     al, LPT_CTRL_INIT | LPT_CTRL_SELECT
+    mov     al, LPT_CTRL_INIT OR LPT_CTRL_SELECT
     
     ; Add bidirectional bit for PS/2 mode
     cmp     CfgData.ParMode, 1
@@ -1233,6 +1304,15 @@ NoBidir:
     mov     CfgData.IRQNum, 7
 
     clc
+    pop     cx
+    pop     ax
+    pop     dx
+    ret
+
+NoLPTFound:
+    ; No parallel port detected at this port
+    stc
+    pop     cx
     pop     ax
     pop     dx
     ret
@@ -1263,7 +1343,8 @@ AllocateUMB PROC
     ; Calculate memory needed in paragraphs
     mov     bx, ResidentSize
     add     bx, 15
-    shr     bx, 4
+    mov     cl, 4
+    shr     bx, cl
 
     ; Try to allocate high memory
     mov     ah, 48h
@@ -1510,7 +1591,7 @@ SerialISR PROC FAR
     push    dx
     push    ds
 
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
     ; Read IIR to determine interrupt source
@@ -1599,7 +1680,7 @@ ParallelISR PROC FAR
     push    dx
     push    ds
 
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
     ; Handle parallel port interrupt
@@ -1771,7 +1852,8 @@ StateCRCHi:
 FrameError:
     ; Reset state on error
     mov     RxState, STATE_IDLE
-    inc     dword ptr Statistics.CRCErrors
+    lea     bx, Statistics.CRCErrors
+    call    Inc32
 
 ProcessDone:
     pop     di
@@ -1795,9 +1877,10 @@ UpdateCRC PROC
     xor     bl, al
     xor     bh, bh
     shl     bx, 1
-    mov     cx, word ptr CRCTable[bx]
+    mov     cx, word ptr cs:CRCTable[bx]
     mov     ax, RxCRC
-    shr     ax, 8
+    mov     al, ah              ; shr ax, 8 - move high byte to low
+    xor     ah, ah
     xor     ax, cx
     mov     RxCRC, ax
 
@@ -1836,10 +1919,12 @@ ValidateFrame PROC
     call    SendACK
 
     ; Update statistics
-    inc     dword ptr Statistics.RxPackets
+    lea     bx, Statistics.RxPackets
+    call    Inc32
     mov     ax, RxFrameLen
-    add     word ptr Statistics.RxBytes[0], ax
-    adc     word ptr Statistics.RxBytes[2], 0
+    call    ZeroExtend16to32    ; DX:AX = 32-bit length
+    lea     bx, Statistics.RxBytes
+    call    Add32
 
     ret
 
@@ -1876,7 +1961,7 @@ HasHandler:
     ; CX = packet length
     ; AX = protocol ID (for us, always 0 - let LSL demux)
     
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     es, ax
     lea     si, FrameBuffer+3       ; Skip seq + length header
     mov     cx, RxFrameLen
@@ -1884,10 +1969,7 @@ HasHandler:
     
     ; Call LSL receive handler
     ; The handler will allocate ECB and copy data
-    push    ds
-    mov     ds, RxHandlerSeg
-    call    dword ptr [RxHandlerOff]
-    pop     ds
+    call    dword ptr cs:[RxHandlerOff]
     
 NoRxHandler:
     pop     di
@@ -1964,7 +2046,7 @@ MLIDTransmitHandler PROC FAR
     push    di
 
     ; Set up data segment
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
     ; Mark ECB as in use
@@ -2122,7 +2204,7 @@ BuildTransmitFrame PROC
     push    di
 
     ; Set up destination (TxFrameBuffer)
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
     lea     di, TxFrameBuffer
     
@@ -2184,7 +2266,7 @@ BuildFragLoop:
     pop     si
     pop     es
     
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
     
 BuildFragNext:
@@ -2197,7 +2279,7 @@ BuildFragNext:
     
     ; Fill in length field
     pop     di                      ; Position after seq num
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     es, ax
     mov     ax, bx
     stosw                           ; Store length
@@ -2264,10 +2346,12 @@ TransmitLoop:
     call    SendByte
     
     ; Update statistics
-    inc     dword ptr Statistics.TxPackets
+    lea     bx, Statistics.TxPackets
+    call    Inc32
     mov     ax, TxPacketSize
-    add     word ptr Statistics.TxBytes, ax
-    adc     word ptr Statistics.TxBytes+2, 0
+    call    ZeroExtend16to32    ; DX:AX = 32-bit size
+    lea     bx, Statistics.TxBytes
+    call    Add32
     
     pop     si
     pop     dx
@@ -2406,9 +2490,10 @@ UpdateTxCRC PROC
     xor     bl, al
     xor     bh, bh
     shl     bx, 1
-    mov     cx, word ptr CRCTable[bx]
+    mov     cx, word ptr cs:CRCTable[bx]
     mov     ax, word ptr TxCRC
-    shr     ax, 8
+    mov     al, ah              ; shr ax, 8 - move high byte to low
+    xor     ah, ah
     xor     ax, cx
     mov     word ptr TxCRC, ax
     
@@ -2433,7 +2518,7 @@ CompleteTransmitECB PROC
     push    si
     push    di
     
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
     
     ; Remove from queue head
@@ -2517,7 +2602,7 @@ DoGetStats:
     ; ES:BX points to destination
     push    ds
     push    si
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
     lea     si, Statistics
     mov     cx, SIZE Stats
@@ -2534,7 +2619,7 @@ DoSendPacket:
     push    bx
     push    ds
     
-    mov     ax, @data
+    mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
     
     ; Mark ECB as in use
@@ -2625,7 +2710,7 @@ PrintModeStr:
     lea     dx, MsgBaud
     mov     ah, 09h
     int     21h
-    mov     ax, CfgData.BaudRate
+    mov     ax, word ptr CfgData.BaudRate
     call    PrintDecimal
 
     ; Print UART type
@@ -2680,8 +2765,11 @@ PrintHexWord ENDP
 PrintHexByte PROC
     ; Print AL as hex
     push    ax
-    shr     al, 4
+    push    cx
+    mov     cl, 4
+    shr     al, cl
     call    PrintHexDigit
+    pop     cx
     pop     ax
     and     al, 0Fh
     call    PrintHexDigit
@@ -2815,14 +2903,17 @@ DisablePIC1:
     out     021h, al
 
 IRQDisabled:
-    ; Restore interrupt vectors
+    ; Restore INT 2Fh vector
+    ; Load both offset and segment BEFORE changing DS
+    mov     dx, OldInt2F_Off
     push    ds
     mov     ax, OldInt2F_Seg
     mov     ds, ax
-    mov     dx, OldInt2F_Off
     mov     ax, 252Fh
     int     21h
+    pop     ds
 
+    ; Restore hardware interrupt vector
     mov     al, CfgData.IRQNum
     cmp     al, 8
     jb      RestoreBelow8
@@ -2835,7 +2926,9 @@ RestoreBelow8:
 
 RestoreVector:
     mov     ah, 25h
+    ; Load both offset and segment BEFORE changing DS
     mov     dx, OldHwInt_Off
+    push    ds
     mov     ax, OldHwInt_Seg
     mov     ds, ax
     int     21h
@@ -2874,12 +2967,91 @@ DriverBusy:
 UnloadDriver ENDP
 
 ;=============================================================================
+; 32-bit Arithmetic Helper Procedures for 8086 Compatibility
+;=============================================================================
+
+; Inc32 - Increment a DWORD memory operand
+; Input: BX = offset of DWORD to increment
+; Destroys: AX, BX
+Inc32 PROC
+    add     word ptr [bx], 1    ; Increment low word
+    adc     word ptr [bx+2], 0  ; Add carry to high word
+    ret
+Inc32 ENDP
+
+; Add32 - Add DX:AX to a DWORD memory operand
+; Input: DX:AX = 32-bit value to add
+;        BX = offset of DWORD destination
+; Destroys: none (all registers preserved)
+Add32 PROC
+    push    ax
+    push    dx
+    add     word ptr [bx], ax   ; Add low word
+    adc     word ptr [bx+2], dx ; Add high word with carry
+    pop     dx
+    pop     ax
+    ret
+Add32 ENDP
+
+; ZeroExtend16to32 - Zero-extend AX to DX:AX (32-bit)
+; Input: AX = 16-bit value
+; Output: DX:AX = 32-bit zero-extended value
+; Destroys: DX
+ZeroExtend16to32 PROC
+    xor     dx, dx              ; Clear high word
+    ret
+ZeroExtend16to32 ENDP
+
+; LookupBaudDivisor - Find divisor for configured baud rate
+; Input: CfgData.BaudRate (DWORD)
+; Output: BX = divisor value
+; Destroys: AX, CX, SI
+LookupBaudDivisor PROC
+    push    di
+    lea     si, BaudTable
+    
+BaudLoop:
+    ; Load baud rate from table (DWORD)
+    mov     ax, word ptr [si]
+    mov     cx, word ptr [si+2]
+    
+    ; Check for end marker (baud rate = 0)
+    or      ax, cx
+    jz      BaudNotFound
+    
+    ; Compare with configured baud rate
+    mov     ax, word ptr [si]
+    mov     cx, word ptr [si+2]
+    cmp     ax, word ptr CfgData.BaudRate
+    jne     BaudNext
+    cmp     cx, word ptr CfgData.BaudRate+2
+    jne     BaudNext
+    
+    ; Found match - get divisor
+    mov     bx, word ptr [si+4]
+    pop     di
+    ret
+    
+BaudNext:
+    add     si, 6               ; Move to next entry (4 bytes baud + 2 bytes divisor)
+    jmp     BaudLoop
+    
+BaudNotFound:
+    ; Default to 38400 baud if not found (divisor = 3)
+    mov     bx, 3
+    pop     di
+    ret
+LookupBaudDivisor ENDP
+
+;=============================================================================
 ; End of Resident Code
 ;=============================================================================
 
 ResidentEnd:
 
 ; Calculate resident size
-ResidentSize EQU ($ - Start)
+ResidentSize EQU (ResidentEnd - Start)
 
-END Start
+CODE    ENDS
+
+        END Start
