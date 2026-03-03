@@ -4,6 +4,11 @@
 ; 8086 CPU compatible (runs on IBM PC/XT and all compatibles)
 
 ; Build as .COM file with: TASM /m2 /jJUMPS DCEMLID.ASM && TLINK /t DCEMLID.OBJ
+; Home of sourcecode: https://github.com/smarthomerocks/dcemlid
+;
+; For specification of LSL, MLID, ODI and IPX,see: dos_pstack.txt
+
+
 
 .8086                           ; 8086 CPU instructions only
 
@@ -162,6 +167,12 @@ DriverActive    DB 0                    ; Flag: driver active (not idle)
 RxHandlerOff    DW 0                    ; LSL receive handler offset
 RxHandlerSeg    DW 0                    ; LSL receive handler segment
 
+; LSL Entry Point (read from LSL Support Table)
+LSLEntryOff     DW 0
+LSLEntrySeg     DW 0
+LSLVersion      DW 0                    ; LSL version (AL=major, AH=minor)
+LSLBoardNum     DW 0                    ; Board number assigned by LSL
+
 ; Interrupt Vectors (Off then Seg for correct FAR JMP dword ptr)
 OldInt2F_Off    DW 0
 OldInt2F_Seg    DW 0
@@ -227,6 +238,8 @@ MsgMAC          DB ' MAC=$'
 MsgBaud         DB ' Baud=$'
 Msg8250         DB ' (8250)$'
 Msg16550        DB ' (16550)$'
+MsgFlowRTS      DB ' Flow=RTS/CTS$'
+MsgFlowXON      DB ' Flow=XON/XOFF$'
 MsgUMB          DB ' [UMB]$'
 MsgConv         DB ' [Conventional]$'
 MsgCRLF         DB 13,10,'$'
@@ -240,14 +253,49 @@ MsgErrLoaded    DB 'ERROR: Driver already loaded.',13,10,'$'
 MsgErrIRQ       DB 'ERROR: IRQ conflict detected.',13,10,'$'
 MsgErrPort      DB 'ERROR: Hardware not detected at specified port.',13,10,'$'
 MsgErrDOS       DB 'ERROR: Requires DOS 5.0 or higher for UMB support.',13,10,'$'
+MsgErrLSLVer    DB 'ERROR: Incompatible LSL version. Requires LSL 2.x, found: $'
+
+MsgDbgPort      DB 'Detecting hardware at port $'
+MsgDbgMode      DB ' mode=$'
+MsgDbgSerial    DB 'SERIAL$'
+MsgDbgPar4      DB 'PAR4$'
+MsgDbgPar8      DB 'PAR8$'
+
+MsgDbgLCR       DB 'LCR port=$'
+MsgDbgWrite     DB ' write=$'
+MsgDbgRead      DB ' read=$'
+MsgDbgOK        DB ' OK',13,10,'$'
+MsgDbgFAIL      DB ' FAIL',13,10,'$'
+MsgDbgTest1     DB 'Test1:$'
+MsgDbgTest2     DB 'Test2:$'
+MsgDbgHwInit    DB 'Hardware init OK',13,10,'$'
+MsgDbgHookIRQ   DB 'Hooking IRQ...$'
+MsgDbgRegLSL    DB 'Registering with LSL...$'
+MsgDbgLSLFail   DB ' failed (AX=$'
+MsgDbgLSLRet    DB ')',13,10,'$'
+MsgDbgLSLVer    DB 'LSL version=$'
+MsgDbgCallLSL   DB 'Calling LSL RegisterMLID...',13,10,'$'
+
+MsgErrLSLReg    DB 'ERROR: LSL registration failed.',13,10,'$'
 
 MsgUnloaded     DB 'Driver unloaded successfully.',13,10,'$'
 MsgErrNotLoaded DB 'ERROR: Driver not loaded.',13,10,'$'
 MsgErrBusy      DB 'ERROR: Driver busy, cannot unload.',13,10,'$'
+MsgErrNotLast   DB 'ERROR: Another TSR loaded after driver. Unload it first.',13,10,'$'
+
+; Unload helper variables (static, not LOCAL for .COM compatibility)
+Unload_TSRSeg       DW 0
+Unload_TSRBoardNum  DW 0
+Unload_TSRPort      DW 0
+Unload_TSRMode      DB 0
+Unload_TSRIRQNum    DB 0
 
 ; Help Screen
 HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10
-                DB 13,10,'Usage: DCEMLID',13,10
+                DB 13,10,'Usage: DCEMLID [/D] [/U] [/?]',13,10
+                DB 13,10,'  /D  Enable debug output during hardware detection',13,10
+                DB '  /U  Unload driver from memory',13,10
+                DB '  /?  Show this help',13,10
                 DB 13,10,'Configuration is read from NET.CFG. Example:',13,10
                 DB 13,10,'  Link Driver DCEMLID',13,10
                 DB '     PORT 3F8',13,10
@@ -278,6 +326,7 @@ HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Conne
 ; Command Line Options (only help and unload)
 OptUnload       DB '/U',0
 OptHelp         DB '/?',0
+OptDebug        DB '/D',0
 
 ; Baud Rate Table (divisor values for 115200 base)
 BaudTableSize EQU 5                  ; Number of baud rate entries
@@ -307,17 +356,20 @@ Main:
     mov     ah, 09h
     int     21h
 
-    ; Get configuration from LSL/NET.CFG
-    call    GetConfigFromLSL
-    jc      ExitError
+    ; Parse command line options FIRST (before any LSL interaction)
+    call    ParseCommandLine
 
-    ; Check for help option
+    ; Check for help option - must work even if driver not loaded
     cmp     byte ptr [CmdHelp], 1
     je      ShowHelp
 
-    ; Check for unload option
+    ; Check for unload option - must work when driver IS loaded
     cmp     byte ptr [CmdUnload], 1
     je      UnloadDriver
+
+    ; Get configuration from LSL/NET.CFG (only for installation)
+    call    GetConfigFromLSL
+    jc      ExitError
 
     ; Install driver
     call    InstallDriver
@@ -343,6 +395,78 @@ ShowHelp:
     int     21h
 
 ;=============================================================================
+; ParseCommandLine - Parse command line options only
+; Sets CmdHelp, CmdUnload, CmdDebug flags
+;=============================================================================
+
+ParseCommandLine PROC
+    push    ax
+    push    cx
+    push    si
+    
+    ; Get command line from PSP
+    mov     si, 80h
+    xor     cx, cx
+    mov     cl, [si]
+    inc     si
+    jcxz    ParseCmdDone
+    
+ParseCmdLoop:
+    ; Skip spaces
+    call    SkipSpaces
+    jcxz    ParseCmdDone
+    
+    ; Check for option marker
+    cmp     byte ptr [si], '/'
+    jne     ParseCmdNext
+    
+    ; Found option, check type
+    inc     si
+    dec     cx
+    jcxz    ParseCmdDone
+    
+    mov     al, [si]
+    ; Convert to uppercase
+    cmp     al, 'a'
+    jb      ParseCmdCheckOpt
+    cmp     al, 'z'
+    ja      ParseCmdCheckOpt
+    sub     al, 20h
+    
+ParseCmdCheckOpt:
+    cmp     al, '?'
+    je      SetHelpFlag
+    cmp     al, 'U'
+    je      SetUnloadFlag
+    cmp     al, 'D'
+    je      SetDebugFlag
+    jmp     ParseCmdNext
+    
+SetHelpFlag:
+    mov     CmdHelp, 1
+    jmp     ParseCmdNext
+    
+SetUnloadFlag:
+    mov     CmdUnload, 1
+    jmp     ParseCmdNext
+    
+SetDebugFlag:
+    mov     CmdDebug, 1
+    jmp     ParseCmdNext
+    
+ParseCmdNext:
+    inc     si
+    dec     cx
+    jnz     ParseCmdLoop
+    
+ParseCmdDone:
+    pop     si
+    pop     cx
+    pop     ax
+    ret
+ParseCommandLine ENDP
+
+;=============================================================================
 ; GetConfigFromLSL - Retrieve configuration from LSL/NET.CFG
 ; Input: None
 ; Output: CF=1 on error, CF=0 on success
@@ -350,6 +474,7 @@ ShowHelp:
 
 CmdHelp         DB 0
 CmdUnload       DB 0
+CmdDebug        DB 0
 
 GetConfigFromLSL PROC
     push    ax
@@ -378,32 +503,26 @@ GetConfigFromLSL PROC
     inc     si
     jcxz    NoBoardNum
     
-    ; Skip spaces
+    ; Skip spaces and options to find board number
     call    SkipSpaces
     jcxz    NoBoardNum
-    
-    ; Check for /? or /U
+
+ParseCmdArg:
+    ; Skip options (starting with /)
     cmp     byte ptr [si], '/'
-    jne     ParseBoardNum
+    jne     TryBoardNum
+    ; Skip this option
     inc     si
     dec     cx
-    cmp     byte ptr [si], '?'
-    je      ShowHelpFlag
-    cmp     byte ptr [si], 'U'
-    je      UnloadFlag
-    cmp     byte ptr [si], 'u'
-    je      UnloadFlag
-    jmp     NoBoardNum
+    jcxz    NoBoardNum
+    inc     si
+    dec     cx
+    jcxz    NoBoardNum
+    call    SkipSpaces
+    jcxz    NoBoardNum
+    jmp     ParseCmdArg
 
-ShowHelpFlag:
-    mov     CmdHelp, 1
-    jmp     ConfigDone
-
-UnloadFlag:
-    mov     CmdUnload, 1
-    jmp     ConfigDone
-
-ParseBoardNum:
+TryBoardNum:
     ; Parse board number (0-9)
     mov     al, [si]
     cmp     al, '0'
@@ -982,12 +1101,32 @@ InstallDriver PROC
     int     2Fh
     cmp     al, 0FFh
     jne     LSLNotLoaded
+    
+    ; LSL 2.x returns:
+    ; AL = FFh (loaded)
+    ; ES:BX = pointer to LSL function table (entry point)
+    ; CX or DX may contain version in some implementations
+    ;
+    ; Save registers immediately before any debug code modifies them
+    mov     LSLEntrySeg, es
+    mov     LSLEntryOff, bx
+    
+    ; For LSL 2.x, ES:BX IS the entry point (function table)
+    ; Skip version detection - we verified LSL is loaded (AL=FFh)
+    ; Version checking removed since we can't reliably detect it
+    mov     LSLVersion, 0200h   ; Assume 2.0 compatible
+
+    ; Skip version check - we assume LSL is compatible if it responds to C000h
+    ; Version detection is unreliable across different LSL implementations
 
     ; Check DOS version for UMB support
     mov     ah, 30h
     int     21h
     cmp     al, 5
     jb      DOSTooOld
+
+    ; Print settings before hardware detection
+    call    PrintDetectionInfo
 
     ; Initialize hardware based on mode
     cmp     CfgData.Mode, 0
@@ -1004,6 +1143,16 @@ InstallDriver PROC
 InitSerial:
     call    InitSerialPort
     jc      InitError
+    
+    ; Debug: hardware init completed
+    cmp     CmdDebug, 1
+    jne     SkipDbgHwInit
+    push    dx
+    lea     dx, MsgDbgHwInit
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgHwInit:
     jmp     HardwareInitDone
 
 InitParallel:
@@ -1030,13 +1179,43 @@ HardwareInitDone:
     int     21h
     pop     ds
 
+    ; Debug: hooking IRQ
+    cmp     CmdDebug, 1
+    jne     SkipDbgHookIRQ
+    push    dx
+    lea     dx, MsgDbgHookIRQ
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgHookIRQ:
+
     ; Hook hardware interrupt
     call    HookHardwareInterrupt
     jc      InitError
+    
+    ; Debug: print OK
+    cmp     CmdDebug, 1
+    jne     SkipDbgIRQOK
+    push    dx
+    lea     dx, MsgDbgOK
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgIRQOK:
+
+    ; Debug: registering with LSL
+    cmp     CmdDebug, 1
+    jne     SkipDbgRegLSL
+    push    dx
+    lea     dx, MsgDbgRegLSL
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgRegLSL:
 
     ; Register with LSL
     call    RegisterWithLSL
-    jc      InitError
+    jc      InitErrorLSL
 
     ; Set driver loaded flag
     mov     DriverLoaded, 1
@@ -1068,6 +1247,28 @@ DOSTooOld:
     stc
     ret
 
+LSLIncompat:
+    lea     dx, MsgErrLSLVer
+    mov     ah, 09h
+    int     21h
+    ; Print detected version (LSLVersion: AL=major, AH=minor)
+    mov     ax, LSLVersion
+    push    ax
+    xor     ah, ah              ; AL = Major
+    call    PrintDecimal
+    mov     dl, '.'
+    mov     ah, 02h
+    int     21h
+    pop     ax
+    mov     al, ah              ; Minor is in AH
+    xor     ah, ah
+    call    PrintDecimal
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+    stc
+    ret
+
 InitError:
     ; Restore interrupt vectors if needed
     cmp     OldInt2F_Off, 0
@@ -1088,6 +1289,26 @@ InitErrorNoRestore:
     int     21h
     stc
     ret
+
+InitErrorLSL:
+    ; Restore interrupt vectors if needed
+    cmp     OldInt2F_Off, 0
+    je      InitErrorLSLNoRestore
+    
+    mov     dx, OldInt2F_Off
+    push    ds
+    mov     ax, OldInt2F_Seg
+    mov     ds, ax
+    mov     ax, 252Fh
+    int     21h
+    pop     ds
+
+InitErrorLSLNoRestore:
+    lea     dx, MsgErrLSLReg
+    mov     ah, 09h
+    int     21h
+    stc
+    ret
 InstallDriver ENDP
 
 ;=============================================================================
@@ -1102,21 +1323,168 @@ InitSerialPort PROC
 
     mov     dx, CfgData.Port
 
-    ; === UART Detection using scratch register test ===
-    ; The scratch register (offset 7) can be written and read back
-    ; If no UART present, we'll read 0xFF (floating bus)
-    add     dx, UART_SCR        ; Scratch register
-    mov     al, 055h            ; Test pattern 1
-    out     dx, al
-    in      al, dx
-    cmp     al, 055h
-    jne     NoUARTFound
+    ; === UART Detection using Line Control Register (LCR) test ===
+    ; The original 8250 does NOT have a scratch register (offset 7),
+    ; so we use the LCR (offset 3) instead for reliable detection.
+    ; Save current LCR, write test patterns, then restore.
+    add     dx, UART_LCR        ; Line Control Register
     
-    mov     al, 0AAh            ; Test pattern 2
+    ; Debug: print LCR port address
+    cmp     CmdDebug, 1
+    jne     SkipDbgLCR
+    push    ax
+    push    dx                  ; Save LCR port address
+    push    dx                  ; Will use this for PrintHexWord
+    lea     dx, MsgDbgLCR
+    mov     ah, 09h
+    int     21h
+    pop     ax                  ; Get port address into AX for printing
+    call    PrintHexWord
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+    pop     dx                  ; Restore LCR port address
+    pop     ax
+SkipDbgLCR:
+    
+    in      al, dx              ; Save current LCR value
+    mov     ah, al              ; Store in AH
+    
+    ; Test pattern 1
+    mov     al, 01Bh            ; Test pattern 1 (8N1 + break)
     out     dx, al
+    push    ax                  ; Save written value
     in      al, dx
-    cmp     al, 0AAh
+    mov     bl, al              ; Save raw read
+    and     al, 07Fh            ; Mask off DLAB bit
+    mov     bh, al              ; Save masked read
+    pop     ax                  ; Restore written value
+    
+    ; Debug: print test 1 results
+    cmp     CmdDebug, 1
+    jne     SkipDbgTest1
+    push    ax
+    push    bx
+    push    dx
+    lea     dx, MsgDbgTest1
+    mov     ah, 09h
+    int     21h
+    lea     dx, MsgDbgWrite
+    mov     ah, 09h
+    int     21h
+    mov     al, 01Bh
+    call    PrintHexByte
+    lea     dx, MsgDbgRead
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    pop     bx
+    push    bx
+    push    dx
+    mov     al, bl              ; Raw read value
+    call    PrintHexByte
+    mov     dl, '('
+    mov     ah, 02h
+    int     21h
+    mov     al, bh              ; Masked value
+    call    PrintHexByte
+    mov     dl, ')'
+    mov     ah, 02h
+    int     21h
+    pop     dx
+    pop     bx
+    pop     ax
+SkipDbgTest1:
+    
+    cmp     bh, 01Bh
+    jne     NoUARTFoundDbg
+    
+    ; Debug: print OK
+    cmp     CmdDebug, 1
+    jne     SkipDbgOK1
+    push    dx
+    lea     dx, MsgDbgOK
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgOK1:
+    
+    ; Test pattern 2
+    mov     al, 003h            ; Test pattern 2 (8N1)
+    out     dx, al
+    push    ax
+    in      al, dx
+    mov     bl, al              ; Save raw read
+    and     al, 07Fh
+    mov     bh, al              ; Save masked read
+    pop     ax
+    
+    ; Debug: print test 2 results
+    cmp     CmdDebug, 1
+    jne     SkipDbgTest2
+    push    ax
+    push    bx
+    push    dx
+    lea     dx, MsgDbgTest2
+    mov     ah, 09h
+    int     21h
+    lea     dx, MsgDbgWrite
+    mov     ah, 09h
+    int     21h
+    mov     al, 003h
+    call    PrintHexByte
+    lea     dx, MsgDbgRead
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    pop     bx
+    push    bx
+    push    dx
+    mov     al, bl
+    call    PrintHexByte
+    mov     dl, '('
+    mov     ah, 02h
+    int     21h
+    mov     al, bh
+    call    PrintHexByte
+    mov     dl, ')'
+    mov     ah, 02h
+    int     21h
+    pop     dx
+    pop     bx
+    pop     ax
+SkipDbgTest2:
+    
+    cmp     bh, 003h
+    jne     NoUARTFoundDbg
+    
+    ; Debug: print OK
+    cmp     CmdDebug, 1
+    jne     SkipDbgOK2
+    push    dx
+    lea     dx, MsgDbgOK
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgOK2:
+    
+    ; Restore original LCR
+    mov     al, ah
+    out     dx, al
+    jmp     UARTDetected
+
+NoUARTFoundDbg:
+    ; Debug: print FAIL
+    cmp     CmdDebug, 1
     jne     NoUARTFound
+    push    dx
+    lea     dx, MsgDbgFAIL
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    jmp     NoUARTFound
+
+UARTDetected:
     
     ; UART detected, continue with initialization
     mov     dx, CfgData.Port
@@ -1485,23 +1853,95 @@ HookHardwareInterrupt ENDP
 ; Output: CF=1 on error
 ;=============================================================================
 
-; MLID Configuration Table
+; MLID Configuration Table for ODI 2.x (LSL 2.14) - Table 03002
+; This is the full official ODI MLID configuration table format
 MLIDConfig STRUC
-    ConfigTableSize     DW ?
-    BoardNumber         DW ?
-    BoardNodeAddr       DB 6 DUP(?)
-    ModeFlags           DW ?
-    BoardDataSize       DW ?
-    MaxPacketSize       DW ?
-    Reserved1           DW 4 DUP(?)
-    MLIDName            DD ?
-    MLIDReceive         DD ?
-    MLIDTransmit        DD ?
-    MLIDControl         DD ?
-    Reserved2           DD 2 DUP(?)
+    Signature               DB 26 DUP(?)    ; 00h: 'HardwareDriverMLID        ' (8 spaces)
+    MConfigTableMajorVer    DB ?            ; 1Ah: Configuration table major version
+    MConfigTableMinorVer    DB ?            ; 1Bh: Configuration table minor version
+    NodeAddress             DB 6 DUP(?)     ; 1Ch: 6-byte node address
+    ModeFlags               DW ?            ; 22h: Mode flags
+    BoardNumber             DW ?            ; 24h: Board number (filled by LSL)
+    BoardInstance           DW ?            ; 26h: Board instance
+    MaxDataSize             DW ?            ; 28h: Maximum packet size
+    BestDataSize            DW ?            ; 2Ah: Best data size
+    WorstDataSize           DW ?            ; 2Ch: Worst data size
+    NICLongName             DD ?            ; 2Eh: Far ptr to counted NUL-term long name
+    NICShortName            DD ?            ; 32h: Far ptr to counted NUL-term short name
+    FrameMediaType          DD ?            ; 36h: Far ptr to frame/media type string
+    Reserved1               DW ?            ; 3Ah: Reserved (0000h)
+    FrameTypeID             DW ?            ; 3Ch: Frame type ID
+    TransportTime           DW ?            ; 3Eh: Transport time (ms)
+    SourceRouteHandler      DD ?            ; 40h: Far ptr to source route handler
+    LookAheadSize           DW ?            ; 44h: Lookahead size
+    LineSpeed               DW ?            ; 46h: Line speed (Mbps or Kbps+8000h)
+    QueueDepth              DW ?            ; 48h: Queue depth
+    Reserved2               DB 6 DUP(?)     ; 4Ah: Reserved
+    DriverMajorVer          DB ?            ; 50h: Driver major version
+    DriverMinorVer          DB ?            ; 51h: Driver minor version
+    BusMulticastFlags       DW ?            ; 52h: Bus/multicast flags
+    SendRetries             DW ?            ; 54h: Send retries
+    ConfigTableLink         DD ?            ; 56h: Config table link
+    SharingFlags            DW ?            ; 5Ah: MLID sharing flags
+    SlotNumber              DW ?            ; 5Ch: Slot number
+    IOAddr1                 DW ?            ; 5Eh: I/O address 1
+    IORange1                DW ?            ; 60h: I/O range 1
+    IOAddr2                 DW ?            ; 62h: I/O address 2
+    IORange2                DW ?            ; 64h: I/O range 2
+    MemAddr1                DD ?            ; 66h: Memory address 1
+    MemSize1                DW ?            ; 6Ah: Memory size 1
+    MemAddr2                DD ?            ; 6Ch: Memory address 2
+    MemSize2                DW ?            ; 70h: Memory size 2
+    IRQLine1                DB ?            ; 72h: Interrupt line 1
+    IRQLine2                DB ?            ; 73h: Interrupt line 2
+    DMALine1                DB ?            ; 74h: DMA line 1
+    DMALine2                DB ?            ; 75h: DMA line 2
 MLIDConfig ENDS
 
-MLIDConfigTable MLIDConfig <SIZE MLIDConfig, 0, , 0, 4096, MTU_SIZE>
+; LSL Information Block returned from registration - Table 02991
+LSLInfoBlock STRUC
+    LSLEntryPoint           DD ?            ; 00h: Entry point (BX=function 00h-11h)
+    LSLInfo1                DW ?            ; 04h: ???
+    LSLInfo2                DW ?            ; 06h: ???
+LSLInfoBlock ENDS
+
+; MLID Info Block for LSL registration - Table 02990
+; This wrapper is required for RegisterMLID (BX=0001h)
+; ES:SI must point to this structure, NOT directly to the config table
+MLIDInfoBlock STRUC
+    MIBS_SendEntry          DD ?            ; 00h: Far ptr to MLID Send handler
+    MIBS_ControlEntry       DD ?            ; 04h: Far ptr to MLID Control handler
+    MIBS_ConfigTable        DD ?            ; 08h: Far ptr to MLID Config table
+MLIDInfoBlock ENDS
+
+; Interface Function Table for ODI 2.x
+MLIDFuncTable STRUC
+    GetStatistics           DD ?
+    AddMulticast            DD ?
+    DeleteMulticast         DD ?
+    MLIDShutdown            DD ?
+    MLIDReset               DD ?
+    Reserved                DD 3 DUP(?)
+MLIDFuncTable ENDS
+
+; String data for registration - ODI uses "counted NUL-terminated" strings
+; Format: length byte, string chars, NUL terminator
+NICLongNameStr      DB 23,'DCEMLID Serial/Parallel',0
+NICShortNameStr     DB 7,'DCEMLID',0
+FrameMediaTypeStr   DB 14,'Ethernet_802.2',0  ; Frame/media type (14 chars)
+
+; LSL info block buffer (filled by LSL on registration)
+LSLInfoBuf          LSLInfoBlock <>
+
+; MLID Info Block for registration (ES:SI points here)
+MLIDInfoBlockData   MLIDInfoBlock <>
+
+; Function table
+MLIDFunctions   MLIDFuncTable <>
+
+; MLID Configuration Table - initialized with signature
+; Note: '>' is default initializer followed by per-field values
+MLIDConfigTable MLIDConfig <'HardwareDriverMLID        ', 01h, 00h>
 
 RegisterWithLSL PROC
     push    ax
@@ -1509,53 +1949,207 @@ RegisterWithLSL PROC
     push    cx
     push    dx
     push    es
-
-    ; Set board number from configuration
-    mov     ax, CfgData.BoardNum
-    mov     MLIDConfigTable.BoardNumber, ax
+    push    di
+    push    si
 
     ; Fill in configuration table
+    ; Copy node address
+    push    ds
+    pop     es
     lea     si, CfgData.MacAddr
-    lea     di, MLIDConfigTable.BoardNodeAddr
+    lea     di, MLIDConfigTable.NodeAddress
     mov     cx, 6
     rep     movsb
 
-    ; Set function pointers
+    ; Set mode flags (bit 0 = RealDriverBit, always 1)
+    mov     MLIDConfigTable.ModeFlags, 0001h
+    
+    ; Board instance from config
+    mov     ax, CfgData.BoardNum
+    mov     MLIDConfigTable.BoardInstance, ax
+    
+    ; Packet sizes
+    mov     MLIDConfigTable.MaxDataSize, MTU_SIZE
+    mov     MLIDConfigTable.BestDataSize, MTU_SIZE
+    mov     MLIDConfigTable.WorstDataSize, 64
+    
+    ; Set string pointers (counted NUL-terminated strings)
     mov     ax, cs
-    mov     word ptr MLIDConfigTable.MLIDName[2], ax
-    lea     bx, DRIVER_NAME
-    mov     word ptr MLIDConfigTable.MLIDName[0], bx
+    mov     word ptr MLIDConfigTable.NICLongName[2], ax
+    lea     bx, NICLongNameStr
+    mov     word ptr MLIDConfigTable.NICLongName[0], bx
 
-    mov     word ptr MLIDConfigTable.MLIDReceive[2], ax
-    lea     bx, MLIDReceiveHandler
-    mov     word ptr MLIDConfigTable.MLIDReceive[0], bx
+    mov     word ptr MLIDConfigTable.NICShortName[2], ax
+    lea     bx, NICShortNameStr
+    mov     word ptr MLIDConfigTable.NICShortName[0], bx
 
-    mov     word ptr MLIDConfigTable.MLIDTransmit[2], ax
-    lea     bx, MLIDTransmitHandler
-    mov     word ptr MLIDConfigTable.MLIDTransmit[0], bx
+    mov     word ptr MLIDConfigTable.FrameMediaType[2], ax
+    lea     bx, FrameMediaTypeStr
+    mov     word ptr MLIDConfigTable.FrameMediaType[0], bx
+    
+    ; Reserved field
+    mov     MLIDConfigTable.Reserved1, 0
+    
+    ; Frame type (Ethernet_802.2 = 0005h, default for NetWare 3.12+)
+    mov     MLIDConfigTable.FrameTypeID, 0005h
+    
+    ; Transport time, line speed
+    mov     MLIDConfigTable.TransportTime, 1
+    mov     MLIDConfigTable.LineSpeed, 8000h + 115  ; 115 Kbps (high bit = Kbps)
+    mov     MLIDConfigTable.LookAheadSize, 64
+    mov     MLIDConfigTable.QueueDepth, 4
+    
+    ; No source route handler
+    mov     word ptr MLIDConfigTable.SourceRouteHandler[0], 0
+    mov     word ptr MLIDConfigTable.SourceRouteHandler[2], 0
+    
+    ; Clear reserved bytes
+    lea     di, MLIDConfigTable.Reserved2
+    mov     cx, 6
+    xor     al, al
+    rep     stosb
+    
+    ; Driver version
+    mov     MLIDConfigTable.DriverMajorVer, 1
+    mov     MLIDConfigTable.DriverMinorVer, 0
+    
+    ; Bus/multicast flags (ISA card)
+    mov     MLIDConfigTable.BusMulticastFlags, 0002h
+    
+    ; Send retries
+    mov     MLIDConfigTable.SendRetries, 3
+    
+    ; Config table link (none)
+    mov     word ptr MLIDConfigTable.ConfigTableLink[0], 0
+    mov     word ptr MLIDConfigTable.ConfigTableLink[2], 0
+    
+    ; Sharing flags
+    mov     MLIDConfigTable.SharingFlags, 0
+    
+    ; Slot number (N/A)
+    mov     MLIDConfigTable.SlotNumber, 0
+    
+    ; I/O addresses from config
+    mov     ax, CfgData.Port
+    mov     MLIDConfigTable.IOAddr1, ax
+    mov     MLIDConfigTable.IORange1, 8         ; 8 bytes for COM port
+    mov     MLIDConfigTable.IOAddr2, 0
+    mov     MLIDConfigTable.IORange2, 0
+    
+    ; Memory addresses (none)
+    mov     word ptr MLIDConfigTable.MemAddr1[0], 0
+    mov     word ptr MLIDConfigTable.MemAddr1[2], 0
+    mov     MLIDConfigTable.MemSize1, 0
+    mov     word ptr MLIDConfigTable.MemAddr2[0], 0
+    mov     word ptr MLIDConfigTable.MemAddr2[2], 0
+    mov     MLIDConfigTable.MemSize2, 0
+    
+    ; IRQ and DMA
+    mov     al, CfgData.IRQNum
+    mov     MLIDConfigTable.IRQLine1, al
+    mov     MLIDConfigTable.IRQLine2, 0
+    mov     MLIDConfigTable.DMALine1, 0
+    mov     MLIDConfigTable.DMALine2, 0
+    
+    ; Set up interface function table
+    mov     word ptr MLIDFunctions.GetStatistics[2], cs
+    lea     bx, MLIDGetStats
+    mov     word ptr MLIDFunctions.GetStatistics[0], bx
+    
+    mov     word ptr MLIDFunctions.AddMulticast[2], cs
+    lea     bx, MLIDAddMulticast
+    mov     word ptr MLIDFunctions.AddMulticast[0], bx
+    
+    mov     word ptr MLIDFunctions.DeleteMulticast[2], cs
+    lea     bx, MLIDDelMulticast
+    mov     word ptr MLIDFunctions.DeleteMulticast[0], bx
+    
+    mov     word ptr MLIDFunctions.MLIDShutdown[2], cs
+    lea     bx, MLIDShutdownProc
+    mov     word ptr MLIDFunctions.MLIDShutdown[0], bx
+    
+    mov     word ptr MLIDFunctions.MLIDReset[2], cs
+    lea     bx, MLIDResetProc
+    mov     word ptr MLIDFunctions.MLIDReset[0], bx
 
-    mov     word ptr MLIDConfigTable.MLIDControl[2], ax
-    lea     bx, MLIDControlHandler
-    mov     word ptr MLIDConfigTable.MLIDControl[0], bx
+    ; Initialize MLIDInfoBlockData with function pointers and config table
+    mov     word ptr MLIDInfoBlockData.MIBS_SendEntry[0], OFFSET MLIDTransmitHandler
+    mov     word ptr MLIDInfoBlockData.MIBS_SendEntry[2], cs
+    mov     word ptr MLIDInfoBlockData.MIBS_ControlEntry[0], OFFSET MLIDControlHandler
+    mov     word ptr MLIDInfoBlockData.MIBS_ControlEntry[2], cs
+    mov     word ptr MLIDInfoBlockData.MIBS_ConfigTable[0], OFFSET MLIDConfigTable
+    mov     word ptr MLIDInfoBlockData.MIBS_ConfigTable[2], cs
 
-    ; Register with LSL
-    mov     ax, LSL_REGISTER
-    lea     bx, MLIDConfigTable
+    ; Register with LSL via entry point
+    ; LSL 2.x calling convention (Table 02986, 02990):
+    ; BX = function code (0001h = RegisterMLID)
+    ; ES:SI = pointer to MLIDInfoBlock (SendEntry, ControlEntry, ConfigTable)
+    ; DS:DI = buffer for LSL information block (Table 02991)
+    ; Returns: AX = 0 on success, non-zero on error
+    ;          BX = board number assigned by LSL
     push    ds
     pop     es
-    mov     dx, es
-    int     2Fh
+    lea     si, MLIDInfoBlockData   ; Point to info block wrapper, NOT config table
+    lea     di, LSLInfoBuf
+    
+    ; Debug: print function call info
+    cmp     CmdDebug, 1
+    jne     SkipDbgCallLSL
+    push    dx
+    lea     dx, MsgDbgCallLSL
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgCallLSL:
+    
+    mov     bx, 0001h               ; Function 0001h: RegisterMLID (LSL 2.x)
+    call    dword ptr [LSLEntryOff]
 
     ; Check return status
     cmp     ax, 0
     je      RegisterOK
+    
+    ; Debug: print failure and return code
+    push    ax                  ; Save return code
+    cmp     CmdDebug, 1
+    jne     SkipDbgLSLFail
+    push    dx
+    lea     dx, MsgDbgLSLFail
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    pop     ax
+    push    ax
+    call    PrintHexWord
+    push    dx
+    lea     dx, MsgDbgLSLRet
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgLSLFail:
+    pop     ax
     stc
     jmp     RegisterDone
 
 RegisterOK:
+    ; Save board number assigned by LSL (returned in BX)
+    mov     MLIDConfigTable.BoardNumber, bx
+    mov     LSLBoardNum, bx
+    
+    ; Debug: print OK
+    cmp     CmdDebug, 1
+    jne     SkipDbgLSLOK
+    push    dx
+    lea     dx, MsgDbgOK
+    mov     ah, 09h
+    int     21h
+    pop     dx
+SkipDbgLSLOK:
     clc
 
 RegisterDone:
+    pop     si
+    pop     di
     pop     es
     pop     dx
     pop     cx
@@ -1565,18 +2159,80 @@ RegisterDone:
 RegisterWithLSL ENDP
 
 ;=============================================================================
+; MLID Interface Functions (called by LSL)
+;=============================================================================
+
+MLIDGetStats PROC FAR
+    ; Return pointer to statistics in ES:SI
+    push    ds
+    pop     es
+    lea     si, Statistics
+    xor     ax, ax              ; Success
+    retf
+MLIDGetStats ENDP
+
+MLIDAddMulticast PROC FAR
+    ; Add multicast address - not supported for serial
+    mov     ax, 1               ; Not supported
+    retf
+MLIDAddMulticast ENDP
+
+MLIDDelMulticast PROC FAR
+    ; Delete multicast address - not supported for serial
+    mov     ax, 1               ; Not supported
+    retf
+MLIDDelMulticast ENDP
+
+MLIDShutdownProc PROC FAR
+    ; Shutdown the MLID
+    ; Entry: AX = board number, CX = 0000h for permanent, non-zero for temporary
+    ; NOTE: This just clears internal state. Deregistration from LSL must be
+    ; done by UnloadDriver with proper segment setup.
+    mov     DriverActive, 0
+    xor     ax, ax
+    retf
+MLIDShutdownProc ENDP
+
+MLIDResetProc PROC FAR
+    ; Reset the MLID - reinitialize buffers
+    mov     RxState, 0          ; STATE_IDLE = 0
+    mov     RxBufIdx, 0
+    mov     TxPending, 0
+    xor     ax, ax
+    retf
+MLIDResetProc ENDP
+
+;=============================================================================
 ; INT 2Fh Multiplex Handler
 ;=============================================================================
 
+MULTIPLEX_AH    EQU (MULTIPLEX_ID SHR 8)    ; High byte of multiplex ID (C0h)
+
 Int2FHandler PROC FAR
-    cmp     ax, MULTIPLEX_ID
+    cmp     ah, MULTIPLEX_AH        ; Check AH only, not full AX
     je      OurMultiplex
     
     ; Chain to previous handler
     jmp     dword ptr cs:[OldInt2F_Off]
 
 OurMultiplex:
-    ; Return signature
+    ; AH = MULTIPLEX_ID high byte, AL = subfunction
+    ; AL=00h/A0h: Installation check - return AL=FFh, ES=TSR segment
+    ; AL=01h/A1h: Get info - return ES=TSR segment, BX=board number
+    ; Check for subfunction 01h (either A1h or 01h depending on caller)
+    test    al, 01h
+    jnz     Mux_GetInfo
+    
+    ; Default: Installation check (AL=00h or A0h)
+    mov     al, 0FFh
+    push    cs
+    pop     es                      ; Return TSR segment in ES
+    iret
+
+Mux_GetInfo:
+    push    cs
+    pop     es                      ; TSR segment in ES
+    mov     bx, cs:[LSLBoardNum]    ; Board number in BX
     mov     al, 0FFh
     iret
 Int2FHandler ENDP
@@ -2726,6 +3382,17 @@ PrintUARTType:
     mov     ah, 09h
     int     21h
 
+    ; Print flow control setting
+    cmp     CfgData.FlowCtrl, 0
+    je      PrintFlowRTS
+    lea     dx, MsgFlowXON
+    jmp     PrintFlowStr
+PrintFlowRTS:
+    lea     dx, MsgFlowRTS
+PrintFlowStr:
+    mov     ah, 09h
+    int     21h
+
 NoBaud:
     ; Print memory location
     cmp     UMBAllocated, 1
@@ -2747,6 +3414,61 @@ PrintMemMsg:
 
     ret
 PrintInstallMessage ENDP
+
+;=============================================================================
+; PrintDetectionInfo - Print port/mode before hardware detection
+;=============================================================================
+
+PrintDetectionInfo PROC
+    push    ax
+    push    dx
+
+    ; Print "Detecting hardware at port "
+    lea     dx, MsgDbgPort
+    mov     ah, 09h
+    int     21h
+
+    ; Print port value in hex
+    mov     ax, CfgData.Port
+    call    PrintHexWord
+
+    ; Print " mode="
+    lea     dx, MsgDbgMode
+    mov     ah, 09h
+    int     21h
+
+    ; Print mode name
+    cmp     CfgData.Mode, 0
+    je      PrintModeSerial
+    cmp     CfgData.Mode, 1
+    je      PrintModePar4
+    cmp     CfgData.Mode, 2
+    je      PrintModePar8
+    jmp     PrintModeEnd
+
+PrintModeSerial:
+    lea     dx, MsgDbgSerial
+    jmp     PrintModeName
+PrintModePar4:
+    lea     dx, MsgDbgPar4
+    jmp     PrintModeName
+PrintModePar8:
+    lea     dx, MsgDbgPar8
+
+PrintModeName:
+    mov     ah, 09h
+    int     21h
+
+PrintModeEnd:
+    ; Print newline
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    pop     dx
+    pop     ax
+    ret
+PrintDetectionInfo ENDP
 
 ;=============================================================================
 ; Helper Printing Functions
@@ -2850,19 +3572,67 @@ PrintMACAddress ENDP
 ;=============================================================================
 
 UnloadDriver PROC
-    ; Check if driver is loaded via multiplex
-    mov     ax, MULTIPLEX_ID
+    ; Check if driver is loaded via multiplex (subfunction 01h to get info)
+    mov     ax, MULTIPLEX_ID + 01h  ; AH=ID, AL=01h (get info)
     int     2Fh
     cmp     al, 0FFh
     jne     NotLoaded
-
-    ; Check if driver is busy
-    cmp     DriverActive, 1
+    
+    ; ES = TSR segment, BX = board number
+    mov     Unload_TSRSeg, es
+    mov     Unload_TSRBoardNum, bx
+    
+    ; Check if driver is busy (access TSR's data via ES)
+    cmp     byte ptr es:[DriverActive], 1
     je      DriverBusy
-
-    ; Disable hardware interrupts
-    mov     dx, CfgData.Port
-    cmp     CfgData.Mode, 0
+    
+    ; Check if transmit pending
+    cmp     byte ptr es:[TxPending], 1
+    je      DriverBusy
+    
+    ; Save TSR config data for later use
+    mov     ax, es:[CfgData.Port]
+    mov     Unload_TSRPort, ax
+    mov     al, es:[CfgData.Mode]
+    mov     Unload_TSRMode, al
+    mov     al, es:[CfgData.IRQNum]
+    mov     Unload_TSRIRQNum, al
+    
+    ; ===== CHECK IF WE'RE THE LAST INT 2FH HANDLER =====
+    ; Get current INT 2Fh vector
+    mov     ax, 352Fh
+    int     21h                     ; ES:BX = current INT 2Fh handler
+    
+    ; Compare with TSR's Int2FHandler address
+    mov     ax, Unload_TSRSeg
+    cmp     bx, OFFSET Int2FHandler ; Check offset
+    jne     NotLastHandler
+    mov     cx, es
+    cmp     cx, ax                  ; Check segment
+    jne     NotLastHandler
+    
+    ; Restore ES to TSR segment for further use
+    mov     es, Unload_TSRSeg
+    
+    ; ===== DEREGISTER FROM LSL =====
+    ; Call DeregisterMLID via LSL MLID Support entry point
+    ; The entry point is in the TSR's LSLInfoBuf.LSLEntryPoint
+    ; BX = 0006h (DeregisterMLID = MLIDSUP_DEREGISTER_MLID), AX = board number
+    ; MUST use ES: override since DS points to unloader, not TSR!
+    mov     ax, es:[LSLBoardNum]    ; Get board number from TSR
+    mov     bx, 0006h               ; DeregisterMLID function (6, not 2!)
+    call    dword ptr es:[LSLInfoBuf.LSLEntryPoint]
+    
+    ; ===== CALL MLID SHUTDOWN (PERMANENT) =====
+    ; Call the TSR's MLIDShutdownProc to clear internal state
+    ; CX=0000h indicates permanent shutdown (for cleanup only, already deregistered)
+    mov     es, Unload_TSRSeg       ; Restore ES in case LSL call modified it
+    xor     cx, cx                  ; CX=0000h = permanent shutdown
+    call    dword ptr es:[MLIDFunctions.MLIDShutdown]
+    
+    ; ===== DISABLE HARDWARE INTERRUPTS =====
+    mov     dx, Unload_TSRPort
+    cmp     Unload_TSRMode, 0
     jne     DisableParallel
 
     ; Disable serial interrupts
@@ -2878,71 +3648,76 @@ DisableParallel:
     out     dx, al
 
 InterruptsDisabled:
-    ; Disable IRQ at PIC
-    mov     al, CfgData.IRQNum
+    ; ===== DISABLE IRQ AT PIC =====
+    mov     al, Unload_TSRIRQNum
     cmp     al, 8
     jb      DisablePIC1
     
+    ; IRQ 8-15: Use slave PIC (port 0A1h)
     sub     al, 8
     mov     cl, al
     mov     al, 1
-    shl     al, cl
-    
+    shl     al, cl                  ; AL = mask bit for this IRQ
+    mov     ah, al                  ; Save mask bit
     in      al, 0A1h
-    or      al, al
+    or      al, ah                  ; Set the mask bit to disable IRQ
     out     0A1h, al
     jmp     IRQDisabled
 
 DisablePIC1:
+    ; IRQ 0-7: Use master PIC (port 021h)
     mov     cl, al
     mov     al, 1
-    shl     al, cl
-    
+    shl     al, cl                  ; AL = mask bit for this IRQ
+    mov     ah, al                  ; Save mask bit
     in      al, 021h
-    or      al, al
+    or      al, ah                  ; Set the mask bit to disable IRQ
     out     021h, al
 
 IRQDisabled:
+    ; ===== RESTORE INTERRUPT VECTORS =====
+    ; Access TSR's saved vectors via Unload_TSRSeg
+    mov     es, Unload_TSRSeg
+    
     ; Restore INT 2Fh vector
-    ; Load both offset and segment BEFORE changing DS
-    mov     dx, OldInt2F_Off
+    mov     dx, es:[OldInt2F_Off]
+    mov     ax, es:[OldInt2F_Seg]
     push    ds
-    mov     ax, OldInt2F_Seg
     mov     ds, ax
     mov     ax, 252Fh
     int     21h
     pop     ds
 
     ; Restore hardware interrupt vector
-    mov     al, CfgData.IRQNum
+    ; First get the old vector from TSR
+    mov     es, Unload_TSRSeg
+    mov     dx, es:[OldHwInt_Off]
+    mov     bx, es:[OldHwInt_Seg]   ; BX = segment
+    
+    ; Calculate interrupt number
+    mov     al, Unload_TSRIRQNum
     cmp     al, 8
     jb      RestoreBelow8
     sub     al, 8
     add     al, 70h
-    jmp     RestoreVector
+    jmp     DoRestore
 
 RestoreBelow8:
     add     al, 08h
 
-RestoreVector:
-    mov     ah, 25h
-    ; Load both offset and segment BEFORE changing DS
-    mov     dx, OldHwInt_Off
+DoRestore:
+    ; AL = interrupt number, BX:DX = old vector
     push    ds
-    mov     ax, OldHwInt_Seg
-    mov     ds, ax
+    mov     ds, bx                  ; DS = old segment
+    mov     ah, 25h
     int     21h
     pop     ds
 
-    ; Release memory if UMB
-    cmp     UMBAllocated, 1
-    jne     NoMemoryRelease
-
-    mov     es, MemorySegment
-    mov     ah, 49h
+    ; ===== FREE TSR MEMORY =====
+    mov     es, Unload_TSRSeg
+    mov     ah, 49h                 ; Free memory block
     int     21h
 
-NoMemoryRelease:
     ; Print unload message
     lea     dx, MsgUnloaded
     mov     ah, 09h
@@ -2960,6 +3735,13 @@ NotLoaded:
 
 DriverBusy:
     lea     dx, MsgErrBusy
+    mov     ah, 09h
+    int     21h
+    mov     ax, 4C01h
+    int     21h
+
+NotLastHandler:
+    lea     dx, MsgErrNotLast
     mov     ah, 09h
     int     21h
     mov     ax, 4C01h

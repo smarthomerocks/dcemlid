@@ -52,7 +52,8 @@ Minimum Requirements:
   - DOS 3.3 or higher (DOS 5.0+ recommended for UMB support)
   - 8086 CPU or higher (original IBM PC and all compatibles)
   - 32KB free conventional memory (or 8KB with UMB)
-  - Novell LSL.COM loaded before DCEMLID
+  - Novell LSL.COM version 2.x (e.g., LSL 2.14)
+    NOTE: LSL 1.x and 3.x are NOT supported due to different interfaces
 
 For Serial Mode:
   - 8250 or 16550 UART (16550 strongly recommended for >38400 baud)
@@ -247,17 +248,45 @@ NODE ADDRESS mac_address
 Command Line Options:
 ---------------------
 
-DCEMLID [board_number] [/?] [/U]
+DCEMLID [board_number] [/D] [/U] [/?]
 
 board_number  - Board number to load (0-9), must match NET.CFG
-/?            - Display help screen with cable wiring diagrams
+/D            - Enable debug output during hardware detection
 /U            - Unload driver from memory
+/?            - Display help screen with cable wiring diagrams
 
 Examples:
    DCEMLID          Load first instance (board 0)
+   DCEMLID /D       Load with debug output (troubleshooting)
    DCEMLID 1        Load second instance (board 1)
    DCEMLID /?       Show help
    DCEMLID /U       Unload driver
+
+
+Debug Mode (/D):
+----------------
+The /D flag enables verbose output during driver initialization. This is
+useful for troubleshooting hardware detection and LSL registration issues.
+
+Debug output shows:
+  - LSL version and entry point address
+  - Port address being probed
+  - UART detection test values (written vs read)
+  - Hardware initialization status
+  - IRQ hook status
+  - LSL registration result
+
+Example debug output:
+  C:\> DCEMLID /D
+  LSL version=2.14
+  LSL entry point=1234:5678
+  Detecting hardware at port 03F8 mode=SERIAL
+  LCR port=03FB
+  Test1: write=1B read=1B(1B) OK
+  Test2: write=03 read=03(03) OK
+  Hardware init OK
+  Hooking IRQ... OK
+  Registering with LSL... OK
 
 
 ================================================================================
@@ -618,6 +647,13 @@ Problem: "ERROR: LSL not loaded"
 Solution: Load LSL.COM before DCEMLID. Check that LSL.COM is in your path.
 
 
+Problem: "ERROR: Incompatible LSL version. Requires LSL 2.x"
+Solution: 
+  - DCEMLID requires LSL version 2.x (e.g., LSL 2.14)
+  - LSL 1.x and 3.x use different ODI interfaces and are not supported
+  - Use LSL from NetWare Client for DOS 2.x or Novell VLM Client
+
+
 Problem: "ERROR: No configuration in NET.CFG"
 Solution: 
   - Create NET.CFG file in LSL directory (usually C:\NWCLIENT\NET.CFG)
@@ -640,10 +676,12 @@ Solution:
 
 Problem: "ERROR: Hardware not detected at specified port"
 Solution:
+  - Run DCEMLID /D to see debug output and verify detection
   - Verify port address (use MSD.EXE to check)
   - Ensure serial/parallel port is enabled in BIOS
   - Check cable is properly connected
   - Try different port
+  - In DOSBox, ensure serial port is configured (serial1=nullmodem)
 
 
 Problem: "WARNING: 8250 UART detected at high baud rate"

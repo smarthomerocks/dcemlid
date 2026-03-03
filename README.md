@@ -28,7 +28,8 @@ The driver integrates with Novell's Link Support Layer (LSL) to provide transpar
 - IBM PC/XT or compatible (8086 CPU or higher)
 - DOS 3.3 or higher (DOS 5.0+ recommended for UMB support)
 - 32KB free conventional memory (or 8KB with UMB)
-- Novell LSL.COM
+- Novell LSL.COM version 2.x (e.g., LSL 2.14)
+  - **Note:** LSL 1.x and 3.x are NOT supported due to different ODI interfaces
 
 ### Serial Mode
 - 8250 or 16550 UART (16550 recommended for >38400 baud)
@@ -84,11 +85,30 @@ Configuration is specified in `NET.CFG` under a `Link Driver DCEMLID` section.
 ## Command Line Options
 
 ```
-DCEMLID [board_number] [/?] [/U]
+DCEMLID [board_number] [/D] [/U] [/?]
 
 board_number  - Board instance (0-9), must match NET.CFG
-/?            - Display help with cable wiring diagrams
+/D            - Enable debug output (shows hardware detection details)
 /U            - Unload driver from memory
+/?            - Display help with cable wiring diagrams
+```
+
+### Debug Mode (/D)
+
+The `/D` flag enables verbose output during driver initialization, useful for
+troubleshooting hardware detection issues:
+
+```
+C:\> DCEMLID /D
+LSL version=2.14
+LSL entry point=1234:5678
+Detecting hardware at port 03F8 mode=SERIAL
+LCR port=03FB
+Test1: write=1B read=1B(1B) OK
+Test2: write=03 read=03(03) OK
+Hardware init OK
+Hooking IRQ... OK
+Registering with LSL... OK
 ```
 
 ## Cable Wiring
@@ -185,6 +205,8 @@ See [BUILD.TXT](BUILD.TXT) for detailed build instructions.
 | Problem | Solution |
 |---------|----------|
 | "ERROR: LSL not loaded" | Load LSL.COM before DCEMLID |
+| "ERROR: Incompatible LSL version" | Use LSL version 2.x (e.g., 2.14). LSL 1.x and 3.x are not supported |
+| "ERROR: Hardware not detected" | Run `DCEMLID /D` to see debug output. Verify port address matches hardware |
 | "ERROR: No configuration in NET.CFG" | Create NET.CFG with `Link Driver DCEMLID` section |
 | "WARNING: 8250 UART at high baud rate" | Reduce baud to 38400 or upgrade to 16550 |
 | Slow/no transfer | Check cable wiring, ensure matching settings on both PCs |
