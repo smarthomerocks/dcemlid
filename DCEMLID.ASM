@@ -2206,24 +2206,20 @@ MLIDResetProc ENDP
 ; INT 2Fh Multiplex Handler
 ;=============================================================================
 
-MULTIPLEX_AH    EQU (MULTIPLEX_ID SHR 8)    ; High byte of multiplex ID (C0h)
+; DCEMLID uses C0A0h/C0A1h, LSL uses C000h-C00Fh
+; We must check for our specific AL values to avoid intercepting LSL calls!
 
 Int2FHandler PROC FAR
-    cmp     ah, MULTIPLEX_AH        ; Check AH only, not full AX
-    je      OurMultiplex
+    cmp     ax, 0C0A0h              ; Installation check (our specific ID)
+    je      Mux_InstallCheck
+    cmp     ax, 0C0A1h              ; Get info subfunction
+    je      Mux_GetInfo
     
-    ; Chain to previous handler
+    ; Not ours - chain to previous handler
     jmp     dword ptr cs:[OldInt2F_Off]
 
-OurMultiplex:
-    ; AH = MULTIPLEX_ID high byte, AL = subfunction
-    ; AL=00h/A0h: Installation check - return AL=FFh, ES=TSR segment
-    ; AL=01h/A1h: Get info - return ES=TSR segment, BX=board number
-    ; Check for subfunction 01h (either A1h or 01h depending on caller)
-    test    al, 01h
-    jnz     Mux_GetInfo
-    
-    ; Default: Installation check (AL=00h or A0h)
+Mux_InstallCheck:
+    ; AL=FFh = installed, ES = TSR segment
     mov     al, 0FFh
     push    cs
     pop     es                      ; Return TSR segment in ES
@@ -3224,17 +3220,35 @@ NoESR:
 CompleteTransmitECB ENDP
 
 MLIDControlHandler PROC FAR
-    ; AL = function code
-    cmp     al, MLID_RESET
-    je      DoReset
-    cmp     al, MLID_SHUTDOWN
+    ; BX = function code (ODI standard)
+    ; Function 0: GetMLIDConfiguration - CRITICAL for IPXODI discovery
+    ; Function 5: MLIDShutdown
+    ; Function 6: MLIDReset
+    ; Function 7: SetLookAhead
+    ; Function 8: PromiscuousChange
+    
+    cmp     bx, 0               ; GetMLIDConfiguration
+    je      DoGetConfig
+    cmp     bx, 5               ; MLIDShutdown
     je      DoShutdown
-    cmp     al, MLID_GET_STATS
-    je      DoGetStats
-    cmp     al, MLID_SEND_PKT
-    je      DoSendPacket
-    cmp     al, MLID_REG_RX
-    je      DoRegisterRx
+    cmp     bx, 6               ; MLIDReset
+    je      DoReset
+    cmp     bx, 7               ; SetLookAhead
+    je      DoSetLookAhead
+    cmp     bx, 8               ; PromiscuousChange
+    je      DoPromiscuous
+    
+    ; Unsupported function
+    mov     ax, 8001h           ; Error: unsupported function
+    retf
+
+DoGetConfig:
+    ; Return ES:SI pointing to MLIDConfigTable
+    ; This is how IPXODI discovers and binds to boards!
+    push    cs
+    pop     es
+    lea     si, MLIDConfigTable
+    xor     ax, ax              ; AX=0 = success
     retf
 
 DoReset:
@@ -3243,63 +3257,32 @@ DoReset:
     mov     RxState, STATE_IDLE
     mov     RxBufIdx, 0
     mov     TxPending, 0
+    xor     ax, ax              ; AX=0 = success
     retf
 
 DoShutdown:
     ; Disable interrupts
+    push    dx
     mov     dx, CfgData.Port
     add     dx, UART_IER
     xor     al, al
     out     dx, al
+    pop     dx
+    xor     ax, ax              ; AX=0 = success
     retf
 
-DoGetStats:
-    ; Return statistics structure
-    ; ES:BX points to destination
-    push    ds
-    push    si
-    mov     ax, cs              ; .COM file: CS=DS=ES
-    mov     ds, ax
-    lea     si, Statistics
-    mov     cx, SIZE Stats
-    rep     movsb
-    pop     si
-    pop     ds
+DoSetLookAhead:
+    ; CX = requested lookahead size
+    ; For simple driver, just accept and return success
+    xor     ax, ax              ; AX=0 = success
     retf
 
-DoSendPacket:
-    ; ES:SI = ECB to send
-    ; This is called directly by control handler
-    ; Queue the ECB
-    push    ax
-    push    bx
-    push    ds
-    
-    mov     ax, cs              ; .COM file: CS=DS=ES
-    mov     ds, ax
-    
-    ; Mark ECB as in use
-    mov     byte ptr es:[si+ECB_InUse], 0FFh
-    
-    ; Queue it
-    call    QueueTransmitECB
-    
-    ; Start transmission if idle
-    cmp     TxPending, 0
-    jne     SendPktBusy
-    call    StartNextTransmit
-    
-SendPktBusy:
-    pop     ds
-    pop     bx
-    pop     ax
+DoPromiscuous:
+    ; CX = promiscuous mode (0=off, 1=on)
+    ; For serial link, promiscuous mode not applicable
+    xor     ax, ax              ; AX=0 = success
     retf
 
-DoRegisterRx:
-    ; Store receive handler address
-    mov     RxHandlerSeg, es
-    mov     RxHandlerOff, bx
-    retf
 MLIDControlHandler ENDP
 
 ;=============================================================================
