@@ -84,7 +84,7 @@ Basic Installation Steps:
 2. Add DCEMLID configuration section to NET.CFG:
 
    Link Driver DCEMLID
-      PORT 3F8
+      PORT COM1
       INT 4
       MODE SERIAL
       BAUD 115200
@@ -130,7 +130,7 @@ Each driver has a "Link Driver" section with driver-specific keywords.
 Basic NET.CFG structure:
 
    Link Driver DCEMLID
-      PORT 3F8
+      PORT COM1
       INT 4
       MODE SERIAL
       BAUD 115200
@@ -140,14 +140,14 @@ Basic NET.CFG structure:
 For multiple instances (e.g., two serial connections), specify board numbers:
 
    Link Driver DCEMLID 0
-      PORT 3F8
+      PORT COM1
       INT 4
       MODE SERIAL
       BAUD 115200
       NODE ADDRESS 02608C111111
 
    Link Driver DCEMLID 1
-      PORT 2F8
+      PORT COM2
       INT 3
       MODE SERIAL
       BAUD 57600
@@ -176,20 +176,34 @@ Configuration Keywords:
 -----------------------
 
 PORT address
-   Sets the I/O port base address in hexadecimal.
+   Sets the I/O port. Accepts either symbolic names or hex addresses.
    
-   Serial ports:
+   Symbolic names (recommended - uses BIOS detection):
+     COM1 - First serial port (address from BIOS)
+     COM2 - Second serial port
+     COM3 - Third serial port
+     COM4 - Fourth serial port
+     LPT1 - First parallel port (address from BIOS)
+     LPT2 - Second parallel port
+     LPT3 - Third parallel port
+   
+   Hex addresses (manual detection):
      3F8 - COM1 (default)
      2F8 - COM2
      3E8 - COM3
      2E8 - COM4
-   
-   Parallel ports:
-     378 - LPT1 (default for parallel modes)
+     378 - LPT1 (default)
      278 - LPT2
      3BC - LPT3
    
-   Example: PORT 3F8
+   Examples:
+     PORT COM1       (uses BIOS-detected address, most reliable)
+     PORT LPT1       (uses BIOS-detected address)
+     PORT 3F8        (raw hex address, manual detection)
+   
+   Note: Symbolic names (COM1, LPT1, etc.) are preferred because they
+         use the BIOS Data Area which was validated during POST.
+         Raw hex addresses trigger runtime hardware detection.
 
 INT irq_number
    Sets the IRQ number (decimal).
@@ -297,7 +311,7 @@ Example 1: Basic Serial Connection at Maximum Speed
 ----------------------------------------------------
 NET.CFG (Computer A):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
@@ -306,7 +320,7 @@ NET.CFG (Computer A):
 
 NET.CFG (Computer B):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
@@ -326,7 +340,7 @@ Example 2: Serial Connection with Software Flow Control
 --------------------------------------------------------
 NET.CFG (Computer A):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 57600
@@ -335,7 +349,7 @@ NET.CFG (Computer A):
 
 NET.CFG (Computer B):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 57600
@@ -355,7 +369,7 @@ Example 3: Laptop Serial Connection (COM2)
 -------------------------------------------
 NET.CFG (Laptop A):
   Link Driver DCEMLID
-     PORT 2F8
+     PORT COM2
      INT 3
      MODE SERIAL
      BAUD 57600
@@ -363,7 +377,7 @@ NET.CFG (Laptop A):
 
 NET.CFG (Laptop B):
   Link Driver DCEMLID
-     PORT 2F8
+     PORT COM2
      INT 3
      MODE SERIAL
      BAUD 57600
@@ -382,13 +396,13 @@ Example 4: Parallel Connection (4-bit mode)
 --------------------------------------------
 NET.CFG (Computer A):
   Link Driver DCEMLID
-     PORT 378
+     PORT LPT1
      MODE PAR4
      NODE ADDRESS 02608C111111
 
 NET.CFG (Computer B):
   Link Driver DCEMLID
-     PORT 378
+     PORT LPT1
      MODE PAR4
      NODE ADDRESS 02608C222222
 
@@ -405,13 +419,13 @@ Example 5: Parallel Connection (8-bit EPP mode)
 ------------------------------------------------
 NET.CFG (Computer A):
   Link Driver DCEMLID
-     PORT 378
+     PORT LPT1
      MODE PAR8
      NODE ADDRESS 02608C111111
 
 NET.CFG (Computer B):
   Link Driver DCEMLID
-     PORT 378
+     PORT LPT1
      MODE PAR8
      NODE ADDRESS 02608C222222
 
@@ -429,7 +443,7 @@ Example 6: Old PC with 8250 UART
 ---------------------------------
 NET.CFG (both computers):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 38400
@@ -448,7 +462,7 @@ Example 7: NetWare Client Connection
 -------------------------------------
 NET.CFG (Server):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
@@ -456,7 +470,7 @@ NET.CFG (Server):
 
 NET.CFG (Client):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
@@ -483,14 +497,14 @@ Example 8: Doom/Duke Nukem 3D Multiplayer
 ------------------------------------------
 NET.CFG (Computer A):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
 
 NET.CFG (Computer B):
   Link Driver DCEMLID
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
@@ -508,14 +522,14 @@ Example 9: Multiple Serial Connections (Two Ports)
 ---------------------------------------------------
 NET.CFG (Computer with 2 serial ports):
   Link Driver DCEMLID 0
-     PORT 3F8
+     PORT COM1
      INT 4
      MODE SERIAL
      BAUD 115200
      NODE ADDRESS 02608C111111
 
   Link Driver DCEMLID 1
-     PORT 2F8
+     PORT COM2
      INT 3
      MODE SERIAL
      BAUD 115200
@@ -676,12 +690,21 @@ Solution:
 
 Problem: "ERROR: Hardware not detected at specified port"
 Solution:
+  - Use symbolic port names (PORT COM1) instead of hex addresses
   - Run DCEMLID /D to see debug output and verify detection
   - Verify port address (use MSD.EXE to check)
   - Ensure serial/parallel port is enabled in BIOS
   - Check cable is properly connected
   - Try different port
   - In DOSBox, ensure serial port is configured (serial1=nullmodem)
+
+
+Problem: "ERROR: Port not present in BIOS data area"
+Solution:
+  - The symbolic port name (COM1, LPT1, etc.) was not detected by BIOS
+  - Check that the port is enabled in BIOS setup
+  - Try using a raw hex address instead (PORT 3F8)
+  - Use MSD.EXE to verify which ports BIOS detected
 
 
 Problem: "WARNING: 8250 UART detected at high baud rate"

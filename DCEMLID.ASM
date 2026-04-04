@@ -143,11 +143,37 @@ Config STRUC
     UARTType    DB 0                    ; 0=8250, 1=16550
     ParMode     DB 0                    ; For PAR8: 0=EPP, 1=PS/2
     BoardNum    DW 0                    ; Board number for multiple instances
+    PortSource  DB 1                    ; 0=BDA lookup, 1=Raw address
 Config ENDS
 
 CfgData Config <>
 
-; Statistics Structure
+; ODI Statistics Structure (per ODI Spec v4.00 page 15-18)
+MLIDStatStructure STRUC
+    MStatTableMajorVer    DB 1            ; 00h: Major version (1)
+    MStatTableMinorVer    DB 1            ; 01h: Minor version (01) = v1.01
+    MNumGenericCounters   DW 14           ; 02h: Number of generic counters
+    MValidCounterMask     DD 0            ; 04h: Which counters are valid (0=all valid)
+    MTotalTxPackets       DD 0            ; 08h: Total TX packets
+    MTotalRxPackets       DD 0            ; 0Ch: Total RX packets
+    MNoECBsAvailable      DD 0            ; 10h: No ECBs available count
+    MTxTooBig             DD 0            ; 14h: TX too big count
+    MTxTooSmall           DD 0            ; 18h: TX too small count
+    MRxOverflow           DD 0            ; 1Ch: RX overflow count
+    MRxTooBig             DD 0            ; 20h: RX too big count
+    MRxTooSmall           DD 0            ; 24h: RX too small count
+    MTxMiscError          DD 0            ; 28h: TX misc error count
+    MRxMiscError          DD 0            ; 2Ch: RX misc error count
+    MTxRetryCount         DD 0            ; 30h: TX retry count
+    MRxChecksumError      DD 0            ; 34h: RX checksum error count
+    MRxMismatchError      DD 0            ; 38h: RX mismatch error count
+    MQueueDepth           DD 0            ; 3Ch: Queue depth
+    MNumCustomCounters    DW 0            ; 40h: Number of custom counters (0)
+MLIDStatStructure ENDS
+
+MLIDStatistics MLIDStatStructure <>
+
+; Legacy Stats alias (for backward compat with existing code)
 Stats STRUC
     TxPackets   DD 0
     TxBytes     DD 0
@@ -166,6 +192,14 @@ DriverLoaded    DB 0                    ; Flag: driver loaded
 DriverActive    DB 0                    ; Flag: driver active (not idle)
 RxHandlerOff    DW 0                    ; LSL receive handler offset
 RxHandlerSeg    DW 0                    ; LSL receive handler segment
+
+; Transmit Monitor (for RegisterTxMonitor BX=4)
+TxMonitorOff    DW 0                    ; TX monitor routine offset
+TxMonitorSeg    DW 0                    ; TX monitor routine segment
+TxMonitorActive DB 0                    ; TX monitor enabled flag
+
+; Current LookAhead Size (for SetLookAheadSize BX=9)
+CurrentLookAhead DW 64                  ; Default 64 bytes
 
 ; LSL Entry Point (read from LSL Support Table)
 LSLEntryOff     DW 0
@@ -197,6 +231,10 @@ TxFragOffset    DW 0                    ; Offset within current fragment
 TxTotalSent     DW 0                    ; Total bytes sent in current packet
 TxPacketSize    DW 0                    ; Total packet size
 TxCRC           DW 0FFFFh               ; Transmit CRC
+
+; Saved ECB pointer for receive processing
+SavedECBOff     DW 0                    ; Saved ECB offset during copy
+SavedECBSeg     DW 0                    ; Saved ECB segment during copy
 
 ; Receive State
 RxSeqNum        DB 0                    ; Expected RX sequence number
@@ -235,7 +273,13 @@ MsgPar8PS2      DB 'PAR8-PS2 $'
 MsgPort         DB 'Port=$'
 MsgIRQ          DB ' IRQ=$'
 MsgMAC          DB ' MAC=$'
-MsgBaud         DB ' Baud=$'
+MsgBaud         DB ' Baud='
+MsgBaud9600     DB '9600$'
+MsgBaud19200    DB '19200$'
+MsgBaud38400    DB '38400$'
+MsgBaud57600    DB '57600$'
+MsgBaud115200   DB '115200$'
+MsgBaudUnknown  DB '?$'
 Msg8250         DB ' (8250)$'
 Msg16550        DB ' (16550)$'
 MsgFlowRTS      DB ' Flow=RTS/CTS$'
@@ -252,6 +296,7 @@ MsgErrConfig    DB 'ERROR: No configuration in NET.CFG. Add Link Driver DCEMLID 
 MsgErrLoaded    DB 'ERROR: Driver already loaded.',13,10,'$'
 MsgErrIRQ       DB 'ERROR: IRQ conflict detected.',13,10,'$'
 MsgErrPort      DB 'ERROR: Hardware not detected at specified port.',13,10,'$'
+MsgErrBDAPort   DB 'ERROR: Port not present in BIOS data area.',13,10,'$'
 MsgErrDOS       DB 'ERROR: Requires DOS 5.0 or higher for UMB support.',13,10,'$'
 MsgErrLSLVer    DB 'ERROR: Incompatible LSL version. Requires LSL 2.x, found: $'
 
@@ -298,7 +343,9 @@ HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Conne
                 DB '  /?  Show this help',13,10
                 DB 13,10,'Configuration is read from NET.CFG. Example:',13,10
                 DB 13,10,'  Link Driver DCEMLID',13,10
-                DB '     PORT 3F8',13,10
+                DB '     PORT COM1           ; or COM2, COM3, COM4 (from BIOS)',13,10
+                DB '     PORT LPT1           ; or LPT2, LPT3 (from BIOS)',13,10
+                DB '     PORT 3F8            ; raw hex address (manual detection)',13,10
                 DB '     INT 4',13,10
                 DB '     MODE SERIAL',13,10
                 DB '     BAUD 115200',13,10
@@ -645,9 +692,71 @@ NotSpace:
     jmp     ParseLSLLoop
 
 ParseLSLPort:
+    ; === Check for COMn / LPTn symbolic names ===
+    ; Read first char
+    mov     al, es:[si]
+    call    ToUpper
+    
+    cmp     al, 'C'
+    je      TryParseCOM
+    cmp     al, 'L'
+    je      TryParseLPT
+    jmp     ParsePortHex        ; Not COM or LPT, try hex
+
+TryParseCOM:
+    ; Check for "OM" after 'C'
+    mov     al, es:[si+1]
+    call    ToUpper
+    cmp     al, 'O'
+    jne     ParsePortHex
+    mov     al, es:[si+2]
+    call    ToUpper
+    cmp     al, 'M'
+    jne     ParsePortHex
+    
+    ; Get port number (1-4)
+    mov     al, es:[si+3]
+    cmp     al, '1'
+    jb      ParsePortHex
+    cmp     al, '4'
+    ja      ParsePortHex
+    
+    ; Valid COM1-4, advance SI past "COMn"
+    add     si, 4
+    sub     al, '1'             ; Convert '1'-'4' to 0-3
+    call    LookupBDACOM
+    jmp     ParseLSLLoop
+
+TryParseLPT:
+    ; Check for "PT" after 'L'
+    mov     al, es:[si+1]
+    call    ToUpper
+    cmp     al, 'P'
+    jne     ParsePortHex
+    mov     al, es:[si+2]
+    call    ToUpper
+    cmp     al, 'T'
+    jne     ParsePortHex
+    
+    ; Get port number (1-3)
+    mov     al, es:[si+3]
+    cmp     al, '1'
+    jb      ParsePortHex
+    cmp     al, '3'
+    ja      ParsePortHex
+    
+    ; Valid LPT1-3, advance SI past "LPTn"
+    add     si, 4
+    sub     al, '1'             ; Convert '1'-'3' to 0-2
+    call    LookupBDALPT
+    jmp     ParseLSLLoop
+
+ParsePortHex:
+    ; Not a symbolic name, parse as hex address (raw)
     call    ParseLSLHexValue
     jc      ParseLSLLoop
     mov     CfgData.Port, ax
+    mov     CfgData.PortSource, 1       ; Raw address
     jmp     ParseLSLLoop
 
 ParseLSLInt:
@@ -1085,6 +1194,109 @@ GenerateRandomMAC PROC
 GenerateRandomMAC ENDP
 
 ;=============================================================================
+; LookupBDACOM - Look up COM port address from BIOS Data Area
+; Input: AL = port index (0=COM1, 1=COM2, 2=COM3, 3=COM4)
+; Output: CfgData.Port set, CfgData.PortSource=0 if found
+;         CF=1 if port not present in BDA
+;=============================================================================
+
+LookupBDACOM PROC
+    push    es
+    push    bx
+    
+    ; BDA segment
+    xor     bx, bx
+    mov     es, bx
+    
+    ; COM ports at 0040:0000 (2 bytes each)
+    xor     ah, ah
+    shl     al, 1               ; Multiply index by 2
+    mov     bx, 0400h           ; BDA COM port base
+    add     bx, ax
+    
+    mov     ax, es:[bx]         ; Get port address
+    test    ax, ax
+    jz      BDACOMNotFound
+    
+    mov     CfgData.Port, ax
+    mov     CfgData.PortSource, 0   ; From BDA
+    clc
+    pop     bx
+    pop     es
+    ret
+
+BDACOMNotFound:
+    ; Port not present, print error
+    push    dx
+    lea     dx, MsgErrBDAPort
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    stc
+    pop     bx
+    pop     es
+    ret
+LookupBDACOM ENDP
+
+;=============================================================================
+; LookupBDALPT - Look up LPT port address from BIOS Data Area
+; Input: AL = port index (0=LPT1, 1=LPT2, 2=LPT3)
+; Output: CfgData.Port set, CfgData.PortSource=0 if found
+;         CF=1 if port not present in BDA
+;=============================================================================
+
+LookupBDALPT PROC
+    push    es
+    push    bx
+    
+    ; BDA segment
+    xor     bx, bx
+    mov     es, bx
+    
+    ; LPT ports at 0040:0008 (2 bytes each)
+    xor     ah, ah
+    shl     al, 1               ; Multiply index by 2
+    mov     bx, 0408h           ; BDA LPT port base
+    add     bx, ax
+    
+    mov     ax, es:[bx]         ; Get port address
+    test    ax, ax
+    jz      BDALPTNotFound
+    
+    mov     CfgData.Port, ax
+    mov     CfgData.PortSource, 0   ; From BDA
+    clc
+    pop     bx
+    pop     es
+    ret
+
+BDALPTNotFound:
+    ; Port not present, print error
+    push    dx
+    lea     dx, MsgErrBDAPort
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    stc
+    pop     bx
+    pop     es
+    ret
+LookupBDALPT ENDP
+
+;=============================================================================
+; IODelay - Small delay for I/O register settling
+; Executes ~4-8 CPU cycles delay using JMP $+2 technique
+;=============================================================================
+
+IODelay PROC
+    jmp     short $+2           ; 2 cycles
+    jmp     short $+2           ; 2 cycles
+    jmp     short $+2           ; 2 cycles
+    jmp     short $+2           ; 2 cycles
+    ret
+IODelay ENDP
+
+;=============================================================================
 ; InstallDriver - Main driver installation routine
 ; Output: CF=1 on error
 ;=============================================================================
@@ -1323,7 +1535,11 @@ InitSerialPort PROC
 
     mov     dx, CfgData.Port
 
-    ; === UART Detection using Line Control Register (LCR) test ===
+    ; Check if port came from BDA (already validated by BIOS)
+    cmp     CfgData.PortSource, 0
+    je      UARTDetected        ; Skip detection, go straight to 16550 check
+
+    ; === Raw address: UART Detection using Line Control Register (LCR) test ===
     ; The original 8250 does NOT have a scratch register (offset 7),
     ; so we use the LCR (offset 3) instead for reliable detection.
     ; Save current LCR, write test patterns, then restore.
@@ -1348,11 +1564,14 @@ InitSerialPort PROC
 SkipDbgLCR:
     
     in      al, dx              ; Save current LCR value
+    call    IODelay             ; Allow register to settle
     mov     ah, al              ; Store in AH
     
     ; Test pattern 1
     mov     al, 01Bh            ; Test pattern 1 (8N1 + break)
     out     dx, al
+    call    IODelay             ; Allow register to settle
+    call    IODelay             ; Extra delay for slow hardware
     push    ax                  ; Save written value
     in      al, dx
     mov     bl, al              ; Save raw read
@@ -1412,6 +1631,8 @@ SkipDbgOK1:
     ; Test pattern 2
     mov     al, 003h            ; Test pattern 2 (8N1)
     out     dx, al
+    call    IODelay             ; Allow register to settle
+    call    IODelay             ; Extra delay for slow hardware
     push    ax
     in      al, dx
     mov     bl, al              ; Save raw read
@@ -1612,27 +1833,37 @@ InitParallelPort PROC
 
     mov     dx, CfgData.Port
 
-    ; === Parallel port detection using data register test ===
-    ; Write test patterns and read back
+    ; Check if port came from BDA (already validated by BIOS)
+    cmp     CfgData.PortSource, 0
+    je      LPTDetected         ; Skip basic detection, go to EPP/mode check
+
+    ; === Raw address: Parallel port detection using data register test ===
+    ; Write test patterns and read back with IO delays
     mov     al, 055h
     out     dx, al
+    call    IODelay             ; Allow register to settle
+    call    IODelay             ; Extra delay for slow hardware
     in      al, dx
     cmp     al, 055h
     jne     NoLPTFound
     
     mov     al, 0AAh
     out     dx, al
+    call    IODelay             ; Allow register to settle
+    call    IODelay             ; Extra delay for slow hardware
     in      al, dx
     cmp     al, 0AAh
     jne     NoLPTFound
-    
-    ; Parallel port detected, continue with initialization
+
+LPTDetected:
+    ; Parallel port detected/validated, continue with initialization
 
     ; Check for PAR8 mode
     cmp     CfgData.Mode, 2
     jne     Par4Mode
 
-    ; Try to detect EPP capability
+    ; Try to detect EPP capability (always do this, BIOS doesn't detect EPP)
+    mov     dx, CfgData.Port
     add     dx, LPT_ECR
     in      al, dx
     mov     cl, 5
@@ -1914,6 +2145,41 @@ MLIDInfoBlock STRUC
     MIBS_ConfigTable        DD ?            ; 08h: Far ptr to MLID Config table
 MLIDInfoBlock ENDS
 
+; LookAheadStruc - Required for packet reception (ODI Spec page 11-14)
+; This structure is passed to GetStackECB to obtain an ECB from protocol stack
+LookAheadStruc STRUC
+    LMediaHeaderPtr         DD ?            ; 00h: Far ptr to media header
+    LookAheadPtr            DD ?            ; 04h: Far ptr to lookahead data
+    LookAheadLen            DW ?            ; 08h: Length of lookahead data
+    LProtID                 DB 6 DUP(?)     ; 0Ah: Protocol ID (6 bytes)
+    LBoardNum               DW ?            ; 10h: Logical board number
+    LDataSize               DW ?            ; 12h: Total packet data size
+    LImmAddress             DB 6 DUP(?)     ; 14h: Immediate (source) address
+    LPacketAttrib           DW ?            ; 1Ah: Packet attributes
+    LDestType               DW ?            ; 1Ch: Destination type (0=unicast, 1=multi, 2=broad)
+    LStartCopyOffset        DW ?            ; 1Eh: Start copy offset (set by protocol)
+    LPriorityLevel          DB ?            ; 20h: Priority level
+    LRESERVED               DB 3 DUP(?)     ; 21h: Reserved
+LookAheadStruc ENDS
+
+; LSL MLID Support function numbers
+MLIDSUP_GET_ECB             EQU 0
+MLIDSUP_RETURN_ECB          EQU 1
+MLIDSUP_DEFRAG_ECB          EQU 2
+MLIDSUP_SCHEDULE_AES        EQU 3
+MLIDSUP_CANCEL_AES          EQU 4
+MLIDSUP_GET_INTERVAL        EQU 5
+MLIDSUP_DEREGISTER_MLID     EQU 6
+MLIDSUP_HOLD_RECV_EVENT     EQU 7
+MLIDSUP_START_CRITICAL      EQU 8
+MLIDSUP_END_CRITICAL        EQU 9
+MLIDSUP_CRITICAL_STATUS     EQU 0Ah
+MLIDSUP_SERVICE_EVENTS      EQU 0Bh
+MLIDSUP_SEND_COMPLETE       EQU 0Eh
+MLIDSUP_ADD_PID             EQU 0Fh
+MLIDSUP_GET_STACK_ECB       EQU 10h
+MLIDSUP_CONTROL_FILTER      EQU 11h
+
 ; Interface Function Table for ODI 2.x
 MLIDFuncTable STRUC
     GetStatistics           DD ?
@@ -1935,6 +2201,9 @@ LSLInfoBuf          LSLInfoBlock <>
 
 ; MLID Info Block for registration (ES:SI points here)
 MLIDInfoBlockData   MLIDInfoBlock <>
+
+; LookAhead buffer for packet reception (passed to GetStackECB)
+RxLookAhead         LookAheadStruc <>
 
 ; Function table
 MLIDFunctions   MLIDFuncTable <>
@@ -2570,7 +2839,11 @@ ValidateFrame PROC
     ; Send ACK
     call    SendACK
 
-    ; Update statistics
+    ; Update ODI statistics (required by GetMLIDStatistics)
+    inc     word ptr MLIDStatistics.MTotalRxPackets
+    adc     word ptr MLIDStatistics.MTotalRxPackets+2, 0
+
+    ; Update legacy statistics
     lea     bx, Statistics.RxPackets
     call    Inc32
     mov     ax, RxFrameLen
@@ -2587,7 +2860,8 @@ DuplicateFrame:
 ValidateFrame ENDP
 
 ;=============================================================================
-; DeliverFrameToLSL - Deliver received frame to LSL
+; DeliverFrameToLSL - Deliver received frame to LSL using ODI protocol
+; Uses GetStackECB, HoldReceiveEvent, and ServiceEvents
 ;=============================================================================
 
 DeliverFrameToLSL PROC
@@ -2600,30 +2874,183 @@ DeliverFrameToLSL PROC
     push    si
     push    di
 
-    ; Check if receive handler is registered
-    cmp     RxHandlerOff, 0
-    jne     HasHandler
-    cmp     RxHandlerSeg, 0
-    je      NoRxHandler
+    ; Set up segments (.COM file)
+    mov     ax, cs
+    mov     ds, ax
 
-HasHandler:
-    ; Set up for LSL call
-    ; LSL expects:
-    ; ES:SI = packet data
-    ; CX = packet length
-    ; AX = protocol ID (for us, always 0 - let LSL demux)
+    ; Received frame is in FrameBuffer+3 (skip seq + 2-byte length)
+    ; Frame format: [dest MAC 6][src MAC 6][type/len 2][data...]
+    ; RxFrameLen = total data length after our header
+
+    ; Fill in LookAheadStruc for GetStackECB
+    ; LMediaHeaderPtr = pointer to Ethernet header (first 14 bytes)
+    lea     ax, FrameBuffer+3
+    mov     word ptr RxLookAhead.LMediaHeaderPtr[0], ax
+    mov     word ptr RxLookAhead.LMediaHeaderPtr[2], cs
+
+    ; LookAheadPtr = pointer to packet data after media header
+    ; For Ethernet, data starts at offset 14 (after MAC headers + type)
+    lea     ax, FrameBuffer+3+14
+    mov     word ptr RxLookAhead.LookAheadPtr[0], ax
+    mov     word ptr RxLookAhead.LookAheadPtr[2], cs
+
+    ; LookAheadLen = min(CurrentLookAhead, data_length)
+    mov     ax, RxFrameLen
+    sub     ax, 14              ; Subtract media header size
+    jbe     RxTooShort          ; Frame too short
+    cmp     ax, CurrentLookAhead
+    jbe     LookAheadOK2
+    mov     ax, CurrentLookAhead
+LookAheadOK2:
+    mov     RxLookAhead.LookAheadLen, ax
+
+    ; LProtID = Protocol ID (for Ethernet_802.2, this is DSAP/SSAP/Control)
+    ; Copy first 6 bytes of data as protocol ID
+    push    si
+    push    di
+    lea     si, FrameBuffer+3+14    ; Point to data after media header
+    lea     di, RxLookAhead.LProtID
+    mov     cx, 6
+    rep     movsb
+    pop     di
+    pop     si
+
+    ; LBoardNum = our registered board number
+    mov     ax, LSLBoardNum
+    mov     RxLookAhead.LBoardNum, ax
+
+    ; LDataSize = total packet size (including media header)
+    mov     ax, RxFrameLen
+    mov     RxLookAhead.LDataSize, ax
+
+    ; LImmAddress = source MAC address (6 bytes at offset 6)
+    push    si
+    push    di
+    lea     si, FrameBuffer+3+6     ; Source MAC at offset 6
+    lea     di, RxLookAhead.LImmAddress
+    mov     cx, 6
+    rep     movsb
+    pop     di
+    pop     si
+
+    ; LPacketAttrib = 0 (normal packet)
+    mov     RxLookAhead.LPacketAttrib, 0
+
+    ; LDestType = determine from destination MAC
+    ; 0 = unicast, 1 = multicast, 2 = broadcast
+    mov     al, byte ptr FrameBuffer+3  ; First byte of dest MAC
+    test    al, 01h                     ; Multicast bit?
+    jz      DestUnicast
+    ; Check for broadcast (FF:FF:FF:FF:FF:FF)
+    cmp     word ptr FrameBuffer+3, 0FFFFh
+    jne     DestMulticast
+    cmp     word ptr FrameBuffer+5, 0FFFFh
+    jne     DestMulticast
+    cmp     word ptr FrameBuffer+7, 0FFFFh
+    jne     DestMulticast
+    mov     RxLookAhead.LDestType, 2    ; Broadcast
+    jmp     DestTypeDone
+DestMulticast:
+    mov     RxLookAhead.LDestType, 1    ; Multicast
+    jmp     DestTypeDone
+DestUnicast:
+    mov     RxLookAhead.LDestType, 0    ; Unicast
+DestTypeDone:
+
+    ; LStartCopyOffset = 0 (protocol will set this)
+    mov     RxLookAhead.LStartCopyOffset, 0
+
+    ; LPriorityLevel = 0
+    mov     RxLookAhead.LPriorityLevel, 0
+
+    ; Call GetStackECB (BX=10h) to get ECB from protocol stack
+    ; DS:DI = pointer to LookAheadStruc
+    ; Returns: AX = status, ES:SI = ECB pointer
+    cli                             ; Disable interrupts per spec
+    lea     di, RxLookAhead
+    mov     bx, MLIDSUP_GET_STACK_ECB   ; 10h
+    call    dword ptr [LSLInfoBuf.LSLEntryPoint]
     
-    mov     ax, cs              ; .COM file: CS=DS=ES
-    mov     es, ax
-    lea     si, FrameBuffer+3       ; Skip seq + length header
-    mov     cx, RxFrameLen
-    xor     ax, ax                  ; Protocol ID = 0
+    test    ax, ax
+    jnz     NoECBAvailable          ; No ECB available
+
+    ; ES:SI now points to the ECB from protocol stack
+    ; Copy packet data into ECB fragment buffers
+    ; ECB fragment list starts at ECB+36 (ECB_FragList)
+    ; Fragment structure: DD address (4), DW size (2) = 6 bytes per fragment
     
-    ; Call LSL receive handler
-    ; The handler will allocate ECB and copy data
-    call    dword ptr cs:[RxHandlerOff]
+    ; Save ECB pointer
+    mov     word ptr cs:[SavedECBOff], si
+    mov     word ptr cs:[SavedECBSeg], es
+
+    ; Check fragment count
+    mov     cx, es:[si+ECB_FragCount]
+    test    cx, cx
+    jz      CopyDone                ; No fragments
+
+    ; Get first fragment info (ES:SI + ECB_FragList)
+    add     si, ECB_FragList
     
-NoRxHandler:
+    ; First fragment: [SI] = DD address, [SI+4] = DW size
+    mov     ax, es:[si+4]           ; AX = fragment buffer size
+    mov     cx, RxFrameLen          ; CX = packet data size
+    cmp     ax, cx
+    jbe     UseFragSize
+    mov     ax, cx                  ; Use smaller of the two
+UseFragSize:
+    mov     cx, ax                  ; CX = bytes to copy
+
+    ; Load destination address from fragment
+    les     di, dword ptr es:[si]   ; ES:DI = fragment buffer
+    
+    ; Set up source (CS:FrameBuffer+3)
+    push    cs
+    pop     ds
+    lea     si, FrameBuffer+3       ; DS:SI = source packet data
+    
+    ; Copy data
+    rep     movsb
+
+CopyDone:
+    ; Restore ECB pointer
+    mov     si, word ptr cs:[SavedECBOff]
+    mov     es, word ptr cs:[SavedECBSeg]
+    
+    ; Restore DS
+    push    cs
+    pop     ds
+    
+    ; Set completion code to success
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    
+    ; Clear InUse flag
+    mov     byte ptr es:[si+ECB_InUse], 0
+
+    ; Call HoldReceiveEvent (BX=7) to queue completed ECB
+    ; ES:SI = pointer to ECB
+    mov     bx, MLIDSUP_HOLD_RECV_EVENT  ; 7
+    call    dword ptr [LSLInfoBuf.LSLEntryPoint]
+
+    ; Call ServiceEvents (BX=0Bh) to process queued events
+    mov     bx, MLIDSUP_SERVICE_EVENTS   ; 0Bh
+    call    dword ptr [LSLInfoBuf.LSLEntryPoint]
+
+    jmp     DeliverDone
+
+NoECBAvailable:
+    ; Update statistics - no ECB available
+    inc     word ptr MLIDStatistics.MNoECBsAvailable
+    adc     word ptr MLIDStatistics.MNoECBsAvailable+2, 0
+    jmp     DeliverDone
+
+RxTooShort:
+    ; Frame too short
+    inc     word ptr MLIDStatistics.MRxTooSmall
+    adc     word ptr MLIDStatistics.MRxTooSmall+2, 0
+
+DeliverDone:
+    sti                             ; Re-enable interrupts
+
     pop     di
     pop     si
     pop     es
@@ -2813,11 +3240,17 @@ HasPacket:
     ; Start transmitting the frame
     call    TransmitFrame
 
-    ; Mark as transmitting
-    mov     TxPending, 1
-    mov     TxRetryCount, 0
+    ; Complete ECB immediately after transmission
+    ; (For now, don't wait for ACK - allows IPXODI to work without peer)
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    call    CompleteTransmitECB
 
-    jmp     StartDone
+    ; Start next transmission if queued
+    cmp     word ptr TxQueueHead, 0
+    je      StartDone
+    cmp     word ptr TxQueueHead+2, 0
+    je      StartDone
+    jmp     HasPacket           ; Process next queued ECB
 
 TransmitError:
     ; Complete ECB with error
@@ -2826,7 +3259,7 @@ TransmitError:
     call    CompleteTransmitECB
     
     ; Try next packet
-    call    StartNextTransmit
+    jmp     HasPacket
 
 NoPacket:
 StartDone:
@@ -2997,7 +3430,11 @@ TransmitLoop:
     mov     al, FRAME_START
     call    SendByte
     
-    ; Update statistics
+    ; Update ODI statistics (required by GetMLIDStatistics)
+    inc     word ptr MLIDStatistics.MTotalTxPackets
+    adc     word ptr MLIDStatistics.MTotalTxPackets+2, 0
+    
+    ; Update legacy statistics
     lea     bx, Statistics.TxPackets
     call    Inc32
     mov     ax, TxPacketSize
@@ -3156,8 +3593,9 @@ UpdateTxCRC PROC
 UpdateTxCRC ENDP
 
 ;=============================================================================
-; CompleteTransmitECB - Complete ECB and remove from queue
+; CompleteTransmitECB - Complete ECB and remove from queue using ODI protocol
 ; Input: ES:SI = ECB, CompCode already set
+; Uses SendComplete (BX=0Eh) and ServiceEvents (BX=0Bh)
 ;=============================================================================
 
 CompleteTransmitECB PROC
@@ -3191,22 +3629,23 @@ QueueStillHasItems:
     ; Clear ECB in use flag
     mov     byte ptr es:[si+ECB_InUse], 0
     
-    ; Check if there's an ESR (Event Service Routine)
-    cmp     word ptr es:[si+ECB_ESR], 0
-    jne     HasESR
-    cmp     word ptr es:[si+ECB_ESR+2], 0
-    je      NoESR
-    
-HasESR:
-    ; Call the ESR
-    ; ES:SI already points to ECB
-    call    dword ptr es:[si+ECB_ESR]
-    
-NoESR:
-    ; Clear current ECB
+    ; Clear current ECB tracking
     mov     word ptr TxCurrentECB, 0
     mov     word ptr TxCurrentECB+2, 0
     mov     TxPending, 0
+
+    ; Use ODI SendComplete to queue ECB for ESR dispatch
+    ; BX = 0Eh (MLIDSUP_SEND_COMPLETE)
+    ; ES:SI = pointer to ECB
+    cli                             ; Interrupts must be disabled
+    mov     bx, MLIDSUP_SEND_COMPLETE   ; 0Eh
+    call    dword ptr [LSLInfoBuf.LSLEntryPoint]
+    
+    ; Call ServiceEvents to dispatch queued ESRs
+    mov     bx, MLIDSUP_SERVICE_EVENTS  ; 0Bh
+    call    dword ptr [LSLInfoBuf.LSLEntryPoint]
+    
+    sti                             ; Re-enable interrupts
     
     pop     di
     pop     si
@@ -3220,26 +3659,32 @@ NoESR:
 CompleteTransmitECB ENDP
 
 MLIDControlHandler PROC FAR
-    ; BX = function code (ODI standard)
-    ; Function 0: GetMLIDConfiguration - CRITICAL for IPXODI discovery
-    ; Function 5: MLIDShutdown
-    ; Function 6: MLIDReset
-    ; Function 7: SetLookAhead
-    ; Function 8: PromiscuousChange
+    ; BX = function code (ODI standard per spec page 18-10 to 18-20)
+    ; Function 0: GetMLIDConfiguration (required)
+    ; Function 1: GetMLIDStatistics (required)
+    ; Function 4: RegisterTxMonitor (required)
+    ; Function 5: MLIDShutdown (required)
+    ; Function 6: MLIDReset (required)
+    ; Function 9: SetLookAheadSize (required)
+    ; Function 10: PromiscuousChange (recommended)
     
     cmp     bx, 0               ; GetMLIDConfiguration
     je      DoGetConfig
+    cmp     bx, 1               ; GetMLIDStatistics
+    je      DoGetStats
+    cmp     bx, 4               ; RegisterTxMonitor
+    je      DoRegisterTxMon
     cmp     bx, 5               ; MLIDShutdown
     je      DoShutdown
     cmp     bx, 6               ; MLIDReset
     je      DoReset
-    cmp     bx, 7               ; SetLookAhead
+    cmp     bx, 9               ; SetLookAheadSize
     je      DoSetLookAhead
-    cmp     bx, 8               ; PromiscuousChange
+    cmp     bx, 10              ; PromiscuousChange
     je      DoPromiscuous
     
     ; Unsupported function
-    mov     ax, 8001h           ; Error: unsupported function
+    mov     ax, 8008h           ; LSLERR_BAD_COMMAND
     retf
 
 DoGetConfig:
@@ -3249,6 +3694,54 @@ DoGetConfig:
     pop     es
     lea     si, MLIDConfigTable
     xor     ax, ax              ; AX=0 = success
+    retf
+
+DoGetStats:
+    ; Return ES:SI pointing to MLIDStatistics table
+    push    cs
+    pop     es
+    lea     si, MLIDStatistics
+    xor     ax, ax              ; AX=0 = success
+    retf
+
+DoRegisterTxMon:
+    ; CX = 0 to disable, non-zero to enable
+    ; ES:SI = pointer to TX monitor routine
+    test    cx, cx
+    jz      DisableTxMon
+    
+    ; Check if already registered
+    cmp     TxMonitorActive, 0
+    jne     TxMonAlreadyReg
+    
+    ; Register TX monitor
+    mov     TxMonitorOff, si
+    mov     TxMonitorSeg, es
+    mov     TxMonitorActive, 1
+    xor     ax, ax              ; AX=0 = success
+    retf
+    
+TxMonAlreadyReg:
+    mov     ax, 8001h           ; LSLERR_OUT_OF_RESOURCES
+    retf
+    
+DisableTxMon:
+    ; Verify ES:SI matches registered monitor
+    cmp     si, TxMonitorOff
+    jne     TxMonBadParam
+    mov     ax, es
+    cmp     ax, TxMonitorSeg
+    jne     TxMonBadParam
+    
+    ; Disable TX monitor
+    mov     TxMonitorActive, 0
+    mov     TxMonitorOff, 0
+    mov     TxMonitorSeg, 0
+    xor     ax, ax              ; AX=0 = success
+    retf
+    
+TxMonBadParam:
+    mov     ax, 8002h           ; LSLERR_BAD_PARAMETER
     retf
 
 DoReset:
@@ -3261,7 +3754,8 @@ DoReset:
     retf
 
 DoShutdown:
-    ; Disable interrupts
+    ; CX=0: permanent shutdown, CX non-zero: temporary
+    ; Disable UART interrupts
     push    dx
     mov     dx, CfgData.Port
     add     dx, UART_IER
@@ -3272,8 +3766,16 @@ DoShutdown:
     retf
 
 DoSetLookAhead:
-    ; CX = requested lookahead size
-    ; For simple driver, just accept and return success
+    ; CX = requested lookahead size (0-128)
+    ; Only increase, never decrease
+    cmp     cx, CurrentLookAhead
+    jbe     LookAheadOK
+    cmp     cx, 128             ; Max 128 per spec
+    ja      LookAheadOK
+    mov     CurrentLookAhead, cx
+    ; Update config table
+    mov     MLIDConfigTable.LookAheadSize, cx
+LookAheadOK:
     xor     ax, ax              ; AX=0 = success
     retf
 
@@ -3349,8 +3851,53 @@ PrintModeStr:
     lea     dx, MsgBaud
     mov     ah, 09h
     int     21h
+    
+    ; Look up baud rate and print appropriate string
+    ; Baud rate is 32-bit, compare against known values
     mov     ax, word ptr CfgData.BaudRate
-    call    PrintDecimal
+    mov     dx, word ptr CfgData.BaudRate+2
+    
+    ; Check 9600 (0x00002580)
+    cmp     dx, 0
+    jne     CheckHighBaud
+    cmp     ax, 9600
+    jne     Check19200
+    lea     dx, MsgBaud9600
+    jmp     PrintBaudStr
+    
+Check19200:
+    cmp     ax, 19200
+    jne     Check38400
+    lea     dx, MsgBaud19200
+    jmp     PrintBaudStr
+    
+Check38400:
+    cmp     ax, 38400
+    jne     Check57600
+    lea     dx, MsgBaud38400
+    jmp     PrintBaudStr
+    
+Check57600:
+    cmp     ax, 57600
+    jne     CheckHighBaud
+    lea     dx, MsgBaud57600
+    jmp     PrintBaudStr
+    
+CheckHighBaud:
+    ; Check 115200 (0x0001C200)
+    cmp     dx, 1
+    jne     BaudUnknown
+    cmp     ax, 0C200h
+    jne     BaudUnknown
+    lea     dx, MsgBaud115200
+    jmp     PrintBaudStr
+    
+BaudUnknown:
+    lea     dx, MsgBaudUnknown
+    
+PrintBaudStr:
+    mov     ah, 09h
+    int     21h
 
     ; Print UART type
     cmp     CfgData.UARTType, 0
