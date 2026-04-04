@@ -80,6 +80,14 @@ LPT_CTRL_SELECT EQU 08h                 ; Select In
 LPT_CTRL_IRQ    EQU 10h                 ; Enable IRQ
 LPT_CTRL_BIDIR  EQU 20h                 ; Bidirectional enable (PS/2)
 
+; Parallel Port Status Bits
+LPT_STAT_NIRQ   EQU 04h                 ; nIRQ (active low) - interrupt pending
+LPT_STAT_ERROR  EQU 08h                 ; nError (active low)
+LPT_STAT_ONLINE EQU 10h                 ; Select/Online
+LPT_STAT_PAPER  EQU 20h                 ; Paper Out
+LPT_STAT_NACK   EQU 40h                 ; nAck (active low) - data acknowledged  
+LPT_STAT_NBUSY  EQU 80h                 ; nBusy (active low) - peripheral busy
+
 ; Buffer Sizes
 RX_BUFFER_SIZE  EQU 4096                ; 4KB receive circular buffer
 TX_BUFFER_SIZE  EQU 2048                ; 2KB transmit queue
@@ -87,6 +95,7 @@ TX_BUFFER_SIZE  EQU 2048                ; 2KB transmit queue
 ; Timing Constants
 RETRY_TIMEOUT   EQU 200                 ; 200ms timeout
 MAX_RETRIES     EQU 2                   ; Maximum retry attempts
+MAX_CONFIG_LEN  EQU 512                 ; Maximum config string length
 
 ; MLID Control Function Codes
 MLID_RESET      EQU 01h
@@ -113,6 +122,7 @@ FRAG_Size       EQU 4                   ; DW - Fragment size
 
 ; ECB Completion Codes
 ECB_SUCCESS     EQU 00h                 ; Successful
+ECB_TIMEOUT     EQU 0FAh                ; Timeout waiting for ACK
 ECB_CANCELLED   EQU 0FCh                ; Cancelled by application
 ECB_HARDWARE    EQU 0FDh                ; Hardware error
 ECB_BAD_PKT     EQU 0FEh                ; Malformed packet
@@ -139,11 +149,12 @@ Config STRUC
     BaudRate    DD 115200               ; Baud rate (serial only)
     FlowCtrl    DB 0                    ; 0=RTS/CTS, 1=XON/XOFF
     MacAddr     DB 6 DUP(0)             ; MAC address
-    IRQNum      DB 0                    ; IRQ number
+    IRQNum      DB 0FFh                 ; IRQ number (FFh = auto-detect)
     UARTType    DB 0                    ; 0=8250, 1=16550
     ParMode     DB 0                    ; For PAR8: 0=EPP, 1=PS/2
     BoardNum    DW 0                    ; Board number for multiple instances
     PortSource  DB 1                    ; 0=BDA lookup, 1=Raw address
+    FrameType   DW 0005h                ; Frame type ID (default: 802.2)
 Config ENDS
 
 CfgData Config <>
@@ -168,7 +179,9 @@ MLIDStatStructure STRUC
     MRxChecksumError      DD 0            ; 34h: RX checksum error count
     MRxMismatchError      DD 0            ; 38h: RX mismatch error count
     MQueueDepth           DD 0            ; 3Ch: Queue depth
-    MNumCustomCounters    DW 0            ; 40h: Number of custom counters (0)
+    MTxOKMulticastCount   DD 0            ; 40h: TX multicast count
+    MRxOKMulticastCount   DD 0            ; 44h: RX multicast count
+    MNumCustomCounters    DW 0            ; 48h: Number of custom counters (0)
 MLIDStatStructure ENDS
 
 MLIDStatistics MLIDStatStructure <>
@@ -216,8 +229,12 @@ OldHwInt_Seg    DW 0
 ; Transmit State
 TxSeqNum        DB 0                    ; Current TX sequence number
 TxPending       DB 0                    ; TX in progress flag
+TxPaused        DB 0                    ; TX paused by XON/XOFF flow control
+TxRetransmit    DB 0                    ; NAK received - retransmit needed
 TxRetryCount    DB 0                    ; Current retry count
 TxTimeout       DW 0                    ; Timeout counter
+TxInPtr         DW 0                    ; TX buffer write pointer
+TxOutPtr        DW 0                    ; TX buffer read pointer
 
 ; ECB Queue Management
 TxQueueHead     DD 0                    ; Head of transmit ECB queue
@@ -244,6 +261,11 @@ RxBufIdx        DW 0                    ; Current buffer index
 RxFrameLen      DW 0                    ; Current frame length
 RxCRC           DW 0FFFFh               ; Running CRC calculation
 
+; Backpressure State
+RxPaused        DB 0                    ; 1 = we signaled pause to remote
+RxPauseThresh   DW 3584                 ; Pause threshold (RX_BUFFER_SIZE - 512)
+RxResumeThresh  DW 1024                 ; Resume threshold (1KB free)
+
 ; Buffers
 RxBuffer        DB RX_BUFFER_SIZE DUP(0)
 TxBuffer        DB TX_BUFFER_SIZE DUP(0)
@@ -257,11 +279,18 @@ CfgKeyInt       DB 'INT',0
 CfgKeyBaud      DB 'BAUD',0
 CfgKeyFlow      DB 'FLOW',0
 CfgKeyNode      DB 'NODE',0
+CfgKeyFrame     DB 'FRAME',0
 CfgValSerial    DB 'SERIAL',0
 CfgValPar4      DB 'PAR4',0
 CfgValPar8      DB 'PAR8',0
 CfgValRTS       DB 'RTS',0
 CfgValXON       DB 'XON',0
+
+; Frame Type Values
+CfgVal8022      DB 'ETHERNET_802.2',0
+CfgVal8023      DB 'ETHERNET_802.3',0
+CfgValEthII     DB 'ETHERNET_II',0
+CfgValSNAP      DB 'ETHERNET_SNAP',0
 
 ; Messages
 MsgBanner       DB 'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10,'$'
@@ -288,8 +317,18 @@ MsgUMB          DB ' [UMB]$'
 MsgConv         DB ' [Conventional]$'
 MsgCRLF         DB 13,10,'$'
 
+; Verbose mode statistics messages
+MsgStatsTX      DB 'TX:$'
+MsgStatsRX      DB ' RX:$'
+MsgStatsErr     DB ' Err:$'
+
 MsgWarn8250     DB 'WARNING: 8250 UART at high baud - packet loss may occur.',13,10
                 DB '         Consider using 38400 or lower.',13,10,'$'
+
+MsgWarnCOM34    DB 'WARNING: COM3/COM4 IRQ not specified in NET.CFG.',13,10
+                DB '         Using default (may conflict). Add INT to config.',13,10,'$'
+
+MsgWarnDeregister DB 'WARNING: LSL deregistration failed. Driver may be partially unloaded.',13,10,'$'
 
 MsgErrLSL       DB 'ERROR: LSL not loaded. Load LSL.COM first.',13,10,'$'
 MsgErrConfig    DB 'ERROR: No configuration in NET.CFG. Add Link Driver DCEMLID section.',13,10,'$'
@@ -337,8 +376,9 @@ Unload_TSRIRQNum    DB 0
 
 ; Help Screen
 HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10
-                DB 13,10,'Usage: DCEMLID [/D] [/U] [/?]',13,10
+                DB 13,10,'Usage: DCEMLID [/D] [/V] [/U] [/?]',13,10
                 DB 13,10,'  /D  Enable debug output during hardware detection',13,10
+                DB '  /V  Verbose mode - show live statistics',13,10
                 DB '  /U  Unload driver from memory',13,10
                 DB '  /?  Show this help',13,10
                 DB 13,10,'Configuration is read from NET.CFG. Example:',13,10
@@ -487,6 +527,8 @@ ParseCmdCheckOpt:
     je      SetUnloadFlag
     cmp     al, 'D'
     je      SetDebugFlag
+    cmp     al, 'V'
+    je      SetVerboseFlag
     jmp     ParseCmdNext
     
 SetHelpFlag:
@@ -499,6 +541,10 @@ SetUnloadFlag:
     
 SetDebugFlag:
     mov     CmdDebug, 1
+    jmp     ParseCmdNext
+    
+SetVerboseFlag:
+    mov     CmdVerbose, 1
     jmp     ParseCmdNext
     
 ParseCmdNext:
@@ -522,6 +568,13 @@ ParseCommandLine ENDP
 CmdHelp         DB 0
 CmdUnload       DB 0
 CmdDebug        DB 0
+CmdVerbose      DB 0
+
+; Timer hook for verbose mode statistics
+OldInt1C_Off    DW 0
+OldInt1C_Seg    DW 0
+VerboseTicks    DW 0                ; Counter for tick-based stats display
+VERBOSE_INTERVAL EQU 18 * 5         ; ~5 seconds (18 ticks/sec)
 
 GetConfigFromLSL PROC
     push    ax
@@ -642,8 +695,15 @@ ParseLSLConfig PROC
     push    dx
     push    si
     push    di
+    
+    ; Initialize length limit counter
+    mov     cx, MAX_CONFIG_LEN      ; Maximum config string length
 
 ParseLSLLoop:
+    ; Check length limit to prevent runaway parsing
+    dec     cx
+    jz      ParseLSLDone            ; Limit reached - stop parsing
+    
     ; Check for end of configuration
     mov     al, es:[si]
     test    al, al
@@ -654,6 +714,8 @@ SkipLSLSpaces:
     cmp     byte ptr es:[si], ' '
     jne     NotSpace
     inc     si
+    dec     cx                      ; Count skipped spaces
+    jz      ParseLSLDone
     jmp     SkipLSLSpaces
 NotSpace:
     
@@ -686,6 +748,11 @@ NotSpace:
     lea     di, CfgKeyNode
     call    CompareLSLKeyword
     je      ParseLSLNode
+    
+    ; Check for FRAME keyword
+    lea     di, CfgKeyFrame
+    call    CompareLSLKeyword
+    je      ParseLSLFrame
     
     ; Unknown keyword, skip to end of line
     call    SkipToLSLEOL
@@ -827,6 +894,43 @@ ParseLSLNodeLoop:
     jc      ParseLSLLoop
     stosb
     loop    ParseLSLNodeLoop
+    jmp     ParseLSLLoop
+
+ParseLSLFrame:
+    ; Parse FRAME type value
+    lea     di, CfgVal8022
+    call    CompareLSLValue
+    je      SetFrame8022
+    
+    lea     di, CfgVal8023
+    call    CompareLSLValue
+    je      SetFrame8023
+    
+    lea     di, CfgValEthII
+    call    CompareLSLValue
+    je      SetFrameEthII
+    
+    lea     di, CfgValSNAP
+    call    CompareLSLValue
+    je      SetFrameSNAP
+    
+    ; Unknown frame type - ignore
+    jmp     ParseLSLLoop
+
+SetFrame8022:
+    mov     CfgData.FrameType, 0005h    ; Ethernet 802.2
+    jmp     ParseLSLLoop
+
+SetFrame8023:
+    mov     CfgData.FrameType, 0002h    ; Ethernet 802.3
+    jmp     ParseLSLLoop
+
+SetFrameEthII:
+    mov     CfgData.FrameType, 0004h    ; Ethernet II
+    jmp     ParseLSLLoop
+
+SetFrameSNAP:
+    mov     CfgData.FrameType, 000Ah    ; Ethernet SNAP
     jmp     ParseLSLLoop
 
 ParseLSLDone:
@@ -1432,6 +1536,12 @@ SkipDbgRegLSL:
     ; Set driver loaded flag
     mov     DriverLoaded, 1
 
+    ; Hook timer interrupt for verbose mode if requested
+    cmp     CmdVerbose, 0
+    je      SkipVerboseHook
+    call    HookTimerInt
+SkipVerboseHook:
+
     ; Print success message
     call    PrintInstallMessage
 
@@ -1532,6 +1642,7 @@ InitSerialPort PROC
     push    dx
     push    ax
     push    cx
+    push    bx
 
     mov     dx, CfgData.Port
 
@@ -1539,10 +1650,15 @@ InitSerialPort PROC
     cmp     CfgData.PortSource, 0
     je      UARTDetected        ; Skip detection, go straight to 16550 check
 
+    ; Initialize retry counter for UART detection
+    mov     bl, 3               ; 3 retry attempts for slow 8250
+
+UARTDetectRetry:
     ; === Raw address: UART Detection using Line Control Register (LCR) test ===
     ; The original 8250 does NOT have a scratch register (offset 7),
     ; so we use the LCR (offset 3) instead for reliable detection.
     ; Save current LCR, write test patterns, then restore.
+    mov     dx, CfgData.Port    ; Reset DX in case of retry
     add     dx, UART_LCR        ; Line Control Register
     
     ; Debug: print LCR port address
@@ -1697,13 +1813,25 @@ SkipDbgOK2:
 NoUARTFoundDbg:
     ; Debug: print FAIL
     cmp     CmdDebug, 1
-    jne     NoUARTFound
+    jne     NoUARTRetry
     push    dx
     lea     dx, MsgDbgFAIL
     mov     ah, 09h
     int     21h
     pop     dx
-    jmp     NoUARTFound
+    jmp     NoUARTRetry
+
+NoUARTRetry:
+    ; Check if we should retry
+    dec     bl                  ; Decrement retry counter
+    jz      NoUARTFound         ; No more retries - fail
+    
+    ; Delay before retry (allow slow 8250 to settle)
+    mov     cx, 1000h
+NoUARTRetryDelay:
+    call    IODelay
+    loop    NoUARTRetryDelay
+    jmp     UARTDetectRetry     ; Try again
 
 UARTDetected:
     
@@ -1786,18 +1914,43 @@ NoFIFO:
     mov     al, 01h             ; Enable received data interrupt
     out     dx, al
 
-    ; Determine IRQ number from port
+    ; Determine IRQ number from port (if not specified by user)
+    cmp     CfgData.IRQNum, 0FFh    ; Was INT specified in config?
+    jne     SerialIRQSet            ; Yes - use user-specified value
+    
     mov     ax, CfgData.Port
     cmp     ax, 3F8h
     je      SerialIRQ4
     cmp     ax, 2F8h
     je      SerialIRQ3
-    cmp     ax, 3E8h
-    je      SerialIRQ4
-    cmp     ax, 2E8h
-    je      SerialIRQ3
     
-    ; Default to IRQ4
+    ; COM3/COM4 - warn about non-standard IRQ
+    cmp     ax, 3E8h
+    je      SerialIRQ4_Warn
+    cmp     ax, 2E8h
+    je      SerialIRQ3_Warn
+    
+    ; Unknown port - default to IRQ4
+    jmp     SerialIRQ4
+    
+SerialIRQ4_Warn:
+    ; COM3 at 3E8h - warn and use IRQ4
+    push    dx
+    lea     dx, MsgWarnCOM34
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    jmp     SerialIRQ4
+    
+SerialIRQ3_Warn:
+    ; COM4 at 2E8h - warn and use IRQ3
+    push    dx
+    lea     dx, MsgWarnCOM34
+    mov     ah, 09h
+    int     21h
+    pop     dx
+    jmp     SerialIRQ3
+    
 SerialIRQ4:
     mov     CfgData.IRQNum, 4
     jmp     SerialIRQSet
@@ -1807,6 +1960,7 @@ SerialIRQ3:
 
 SerialIRQSet:
     clc
+    pop     bx
     pop     cx
     pop     ax
     pop     dx
@@ -1815,6 +1969,7 @@ SerialIRQSet:
 NoUARTFound:
     ; No UART detected at this port
     stc
+    pop     bx
     pop     cx
     pop     ax
     pop     dx
@@ -1976,7 +2131,10 @@ UMBSuccess:
     xor     si, si
     xor     di, di
     mov     cx, ResidentSize
-    rep     movsb
+    shr     cx, 1               ; Divide by 2 for word count
+    rep     movsw               ; Copy words
+    adc     cx, cx              ; CX=1 if odd byte remains
+    rep     movsb               ; Copy trailing byte if any
     pop     es
     pop     ds
 
@@ -2050,23 +2208,23 @@ SetVector:
     ; Enable on secondary PIC
     sub     al, 8
     mov     cl, al
-    mov     al, 1
-    shl     al, cl
-    not     al
+    mov     ch, 1
+    shl     ch, cl
+    not     ch                  ; CH = mask with IRQ bit cleared
     
     in      al, 0A1h            ; Read PIC2 mask
-    and     al, al              ; Clear the bit
+    and     al, ch              ; Clear the IRQ bit
     out     0A1h, al
     jmp     EnableDone
 
 EnablePIC1:
     mov     cl, al
-    mov     al, 1
-    shl     al, cl
-    not     al
+    mov     ch, 1
+    shl     ch, cl
+    not     ch                  ; CH = mask with IRQ bit cleared
     
     in      al, 021h            ; Read PIC1 mask
-    and     al, al
+    and     al, ch              ; Clear the IRQ bit
     out     021h, al
 
 EnableDone:
@@ -2078,6 +2236,121 @@ EnableDone:
     pop     ax
     ret
 HookHardwareInterrupt ENDP
+
+;=============================================================================
+; HookTimerInt - Hook INT 1Ch for verbose mode statistics display
+;=============================================================================
+
+HookTimerInt PROC
+    push    ax
+    push    bx
+    push    dx
+    push    es
+    
+    ; Get current INT 1Ch vector
+    mov     ax, 351Ch
+    int     21h
+    mov     OldInt1C_Off, bx
+    mov     OldInt1C_Seg, es
+    
+    ; Set new INT 1Ch vector
+    mov     dx, offset TimerISR
+    mov     ax, 251Ch
+    int     21h
+    
+    ; Initialize tick counter
+    mov     VerboseTicks, VERBOSE_INTERVAL
+    
+    pop     es
+    pop     dx
+    pop     bx
+    pop     ax
+    ret
+HookTimerInt ENDP
+
+;=============================================================================
+; TimerISR - Timer interrupt (INT 1Ch) handler for verbose stats
+;=============================================================================
+
+TimerISR PROC FAR
+    pushf
+    
+    ; Decrement tick counter
+    dec     cs:VerboseTicks
+    jnz     TimerISRChain
+    
+    ; Reset counter
+    mov     cs:VerboseTicks, VERBOSE_INTERVAL
+    
+    ; Display statistics (save all registers)
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+    push    di
+    push    ds
+    push    es
+    
+    ; Set DS to our segment
+    push    cs
+    pop     ds
+    
+    ; Print stats header (cursor return, overwrite line)
+    mov     dl, 0Dh             ; CR only (no LF, overwrite line)
+    mov     ah, 02h
+    int     21h
+    
+    ; Print "TX:"
+    lea     dx, MsgStatsTX
+    mov     ah, 09h
+    int     21h
+    
+    ; Print TX count
+    mov     ax, word ptr Statistics.TxPackets
+    call    PrintDecimal
+    
+    ; Print " RX:"
+    lea     dx, MsgStatsRX
+    mov     ah, 09h
+    int     21h
+    
+    ; Print RX count
+    mov     ax, word ptr Statistics.RxPackets
+    call    PrintDecimal
+    
+    ; Print " Err:"
+    lea     dx, MsgStatsErr
+    mov     ah, 09h
+    int     21h
+    
+    ; Print CRC errors
+    mov     ax, word ptr Statistics.CRCErrors
+    call    PrintDecimal
+    
+    ; Print spaces to clear rest of line
+    mov     dl, ' '
+    mov     ah, 02h
+    int     21h
+    int     21h
+    int     21h
+    int     21h
+    
+    pop     es
+    pop     ds
+    pop     di
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    
+TimerISRChain:
+    popf
+    
+    ; Chain to old handler
+    jmp     dword ptr cs:OldInt1C_Off
+TimerISR ENDP
 
 ;=============================================================================
 ; RegisterWithLSL - Register MLID with Link Support Layer
@@ -2222,13 +2495,13 @@ RegisterWithLSL PROC
     push    si
 
     ; Fill in configuration table
-    ; Copy node address
+    ; Copy node address (6 bytes = 3 words)
     push    ds
     pop     es
     lea     si, CfgData.MacAddr
     lea     di, MLIDConfigTable.NodeAddress
-    mov     cx, 6
-    rep     movsb
+    mov     cx, 3
+    rep     movsw
 
     ; Set mode flags (bit 0 = RealDriverBit, always 1)
     mov     MLIDConfigTable.ModeFlags, 0001h
@@ -2259,8 +2532,9 @@ RegisterWithLSL PROC
     ; Reserved field
     mov     MLIDConfigTable.Reserved1, 0
     
-    ; Frame type (Ethernet_802.2 = 0005h, default for NetWare 3.12+)
-    mov     MLIDConfigTable.FrameTypeID, 0005h
+    ; Frame type (from config, default: Ethernet_802.2 = 0005h)
+    mov     ax, CfgData.FrameType
+    mov     MLIDConfigTable.FrameTypeID, ax
     
     ; Transport time, line speed
     mov     MLIDConfigTable.TransportTime, 1
@@ -2509,44 +2783,266 @@ Int2FHandler ENDP
 SerialISR PROC FAR
     push    ax
     push    bx
+    push    cx
     push    dx
     push    ds
 
     mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
+SerialISR_Loop:
     ; Read IIR to determine interrupt source
     mov     dx, CfgData.Port
     add     dx, UART_IIR
     in      al, dx
     
-    ; Check if it's a receive interrupt
-    test    al, 04h
-    jz      SerialNotReceive
+    ; Bit 0 = 1 means no interrupt pending
+    test    al, 01h
+    jnz     SerialISR_Done
+    
+    ; Mask interrupt ID bits (1-2)
+    and     al, 06h
+    
+    ; Check for Line Status interrupt (IIR=06h) - highest priority
+    cmp     al, 06h
+    je      SerialLineStatus
+    
+    ; Check for Received Data interrupt (IIR=04h)
+    cmp     al, 04h
+    je      SerialReceive
+    
+    ; Check for THRE interrupt (IIR=02h)
+    cmp     al, 02h
+    je      SerialTHRE
+    
+    ; Modem status or unknown - ignore
+    jmp     SerialISR_Loop
 
+SerialLineStatus:
+    ; Read LSR to clear interrupt and check errors
+    mov     dx, CfgData.Port
+    add     dx, UART_LSR
+    in      al, dx
+    
+    ; Check for errors (bits 1-4)
+    test    al, 1Eh             ; OE, PE, FE, BI bits
+    jz      SerialISR_Loop      ; No errors
+    
+    ; Increment error counter based on error type
+    test    al, 02h             ; Overrun Error
+    jz      CheckParity
+    inc     word ptr MLIDStatistics.MRxOverflow
+    adc     word ptr MLIDStatistics.MRxOverflow+2, 0
+    ; Signal sender to pause on overrun (backpressure)
+    call    SendBackpressure
+CheckParity:
+    test    al, 04h             ; Parity Error
+    jz      CheckFraming
+    inc     word ptr MLIDStatistics.MRxMiscError
+    adc     word ptr MLIDStatistics.MRxMiscError+2, 0
+CheckFraming:
+    test    al, 08h             ; Framing Error
+    jz      CheckBreak
+    inc     word ptr MLIDStatistics.MRxMiscError
+    adc     word ptr MLIDStatistics.MRxMiscError+2, 0
+CheckBreak:
+    test    al, 10h             ; Break Indicator
+    jz      SerialISR_Loop
+    ; Break received - reset frame parser state
+    mov     RxState, STATE_IDLE
+    jmp     SerialISR_Loop
+
+SerialTHRE:
+    ; Transmit Holding Register Empty - send next byte if available
+    cmp     TxPending, 0
+    je      SerialISR_Loop      ; Nothing to send
+    
+    ; Check if flow control paused
+    cmp     TxPaused, 0
+    jne     SerialISR_Loop      ; Paused by XON/XOFF
+    
+    ; Check if retransmit requested (NAK received)
+    cmp     TxRetransmit, 0
+    je      SerialNoRetransmit
+    mov     TxRetransmit, 0     ; Clear retransmit flag
+    mov     TxOutPtr, 0         ; Reset to start of frame
+    inc     TxRetryCount
+    cmp     TxRetryCount, MAX_RETRIES
+    jb      SerialNoRetransmit
+    ; Max retries - fail this transmission
+    jmp     SerialTxFailed
+    
+SerialNoRetransmit:
+    ; Get next byte from TX buffer
+    mov     si, TxOutPtr
+    cmp     si, TxInPtr
+    je      SerialTxEmpty       ; Buffer empty
+    
+    mov     al, TxFrameBuffer[si]
+    inc     si
+    cmp     si, TX_BUFFER_SIZE
+    jb      SerialNoWrap
+    xor     si, si              ; Wrap around
+SerialNoWrap:
+    mov     TxOutPtr, si
+    
+    ; Send the byte
+    mov     dx, CfgData.Port
+    out     dx, al
+    
+    ; Check if buffer now empty
+    mov     si, TxOutPtr
+    cmp     si, TxInPtr
+    jne     SerialISR_Loop      ; More data to send
+    
+SerialTxEmpty:
+    ; Buffer empty - disable THRE interrupt
+    mov     TxPending, 0
+    mov     dx, CfgData.Port
+    add     dx, UART_IER
+    in      al, dx
+    and     al, 0FDh            ; Clear THRE interrupt enable (bit 1)
+    out     dx, al
+    
+    ; Complete current ECB if any
+    push    es
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      SerialNoECB
+    cmp     word ptr TxCurrentECB+2, 0
+    je      SerialNoECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    call    CompleteTransmitECB
+SerialNoECB:
+    pop     es
+    jmp     SerialISR_Loop
+
+SerialTxFailed:
+    ; Max retries exceeded - fail this transmission
+    mov     TxPending, 0
+    mov     TxRetryCount, 0     ; Reset for next transmission
+    mov     dx, CfgData.Port
+    add     dx, UART_IER
+    in      al, dx
+    and     al, 0FDh            ; Disable THRE interrupt
+    out     dx, al
+    
+    ; Update failure statistics
+    inc     word ptr MLIDStatistics.MTxRetryCount
+    adc     word ptr MLIDStatistics.MTxRetryCount+2, 0
+    
+    ; Fail current ECB
+    push    es
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      SerialTxFailNoECB
+    cmp     word ptr TxCurrentECB+2, 0
+    je      SerialTxFailNoECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_HARDWARE
+    call    CompleteTransmitECB
+SerialTxFailNoECB:
+    pop     es
+    jmp     SerialISR_Loop
+
+SerialReceive:
     ; Read received data
     mov     dx, CfgData.Port
     in      al, dx
     
+    ; Check for XON/XOFF flow control (if enabled)
+    cmp     CfgData.FlowCtrl, 1 ; XON/XOFF mode?
+    jne     SerialNotXONXOFF
+    
+    cmp     al, XOFF_CHAR       ; XOFF received?
+    je      SerialXOFF
+    cmp     al, XON_CHAR        ; XON received?
+    je      SerialXON
+    jmp     SerialNotXONXOFF
+    
+SerialXOFF:
+    ; Pause transmission
+    mov     TxPaused, 1
+    jmp     SerialISR_Loop
+    
+SerialXON:
+    ; Resume transmission
+    mov     TxPaused, 0
+    ; Check if we have pending data and restart TX
+    cmp     TxPending, 0
+    je      SerialISR_Loop
+    ; Enable THRE interrupt to resume sending
+    mov     dx, CfgData.Port
+    add     dx, UART_IER
+    in      al, dx
+    or      al, 02h             ; Enable THRE interrupt (bit 1)
+    out     dx, al
+    jmp     SerialISR_Loop
+    
+SerialNotXONXOFF:
     ; Check for ACK
     cmp     al, ACK_CHAR
     je      HandleACK
     
+    ; Check for NAK (retransmit request)
+    cmp     al, NAK_CHAR
+    je      HandleNAK
+    
     ; Process received byte through frame parser
     call    ProcessReceivedByte
-    jmp     SerialNotReceive
+    jmp     SerialISR_Loop
 
-HandleACK:
-    ; Read sequence number
+HandleNAK:
+    ; Read expected sequence number with timeout
     mov     dx, CfgData.Port
     push    ax
+    mov     cx, 0FFFFh
+WaitForNAKSeq:
+    add     dx, UART_LSR
+    in      al, dx
+    test    al, 01h             ; Data ready?
+    jnz     NAKSeqReady
+    sub     dx, UART_LSR
+    dec     cx
+    jnz     WaitForNAKSeq
+    pop     ax
+    jmp     SerialISR_Loop      ; Timeout - ignore NAK
+    
+NAKSeqReady:
+    sub     dx, UART_LSR
+    in      al, dx              ; AL = expected sequence number
+    pop     ax                  ; Restore
+    
+    ; Update NAK received statistics
+    inc     word ptr MLIDStatistics.MRxOKMulticastCount
+    adc     word ptr MLIDStatistics.MRxOKMulticastCount+2, 0
+    
+    ; Signal retransmit needed
+    mov     TxRetransmit, 1
+    ; Enable THRE interrupt to trigger retransmit
+    mov     dx, CfgData.Port
+    add     dx, UART_IER
+    in      al, dx
+    or      al, 02h
+    out     dx, al
+    jmp     SerialISR_Loop
+
+HandleACK:
+    ; Read sequence number with timeout
+    mov     dx, CfgData.Port
+    push    ax
+    mov     cx, 0FFFFh          ; Timeout counter
 WaitForSeq:
     add     dx, UART_LSR
     in      al, dx
-    test    al, 01h                 ; Data ready?
-    jz      WaitForSeq
+    test    al, 01h             ; Data ready?
+    jnz     SeqDataReady
+    sub     dx, UART_LSR        ; Reset DX for next iteration
+    dec     cx
+    jnz     WaitForSeq
+    jmp     ACKMismatch         ; Timeout - treat as mismatch
+SeqDataReady:
     sub     dx, UART_LSR
-    in      al, dx                  ; Read sequence number
+    in      al, dx              ; Read sequence number
     
     ; Check if it matches current transmission
     cmp     al, byte ptr TxFrameBuffer
@@ -2571,8 +3067,65 @@ NoCurrentECB:
     
 ACKMismatch:
     pop     ax
+    
+    ; Check if we should retry
+    cmp     TxRetryCount, MAX_RETRIES
+    jae     ACKRetriesExhausted
+    
+    ; Increment retry counter
+    inc     TxRetryCount
+    
+    ; Update retry statistics
+    inc     word ptr MLIDStatistics.MTxRetryCount
+    adc     word ptr MLIDStatistics.MTxRetryCount+2, 0
+    
+    ; Retransmit the current frame
+    push    es
+    push    si
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      ACKNoRetry
+    cmp     word ptr TxCurrentECB+2, 0
+    je      ACKNoRetry
+    
+    ; Retransmit the frame (already built in TxFrameBuffer)
+    call    TransmitFrame
+    pop     si
+    pop     es
+    jmp     SerialISR_Loop
+    
+ACKNoRetry:
+    pop     si
+    pop     es
+    jmp     SerialISR_Loop
 
-SerialNotReceive:
+ACKRetriesExhausted:
+    ; Maximum retries reached - fail the ECB
+    push    es
+    push    si
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      ACKFailDone
+    cmp     word ptr TxCurrentECB+2, 0
+    je      ACKFailDone
+    
+    ; Mark ECB as failed
+    mov     byte ptr es:[si+ECB_CompCode], ECB_TIMEOUT
+    call    CompleteTransmitECB
+    
+    ; Update error statistics
+    inc     word ptr MLIDStatistics.MTxMiscError
+    adc     word ptr MLIDStatistics.MTxMiscError+2, 0
+    
+    ; Try next packet in queue
+    call    StartNextTransmit
+    
+ACKFailDone:
+    pop     si
+    pop     es
+    jmp     SerialISR_Loop
+
+SerialISR_Done:
     ; Send EOI to PIC
     mov     al, 20h
     cmp     CfgData.IRQNum, 8
@@ -2584,6 +3137,7 @@ SerialEOI1:
 
     pop     ds
     pop     dx
+    pop     cx
     pop     bx
     pop     ax
     
@@ -2598,26 +3152,146 @@ SerialISR ENDP
 ParallelISR PROC FAR
     push    ax
     push    bx
+    push    cx
     push    dx
     push    ds
 
     mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
-    ; Handle parallel port interrupt
-    ; (Implementation depends on specific mode)
+    ; Read status register to check interrupt source
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
     
-    ; Send EOI to PIC
+    ; Check if nACK is low (data available in EPP mode)
+    test    al, LPT_STAT_NACK
+    jnz     ParISR_CheckTx      ; nACK high = no incoming data
+    
+    ; Read data from EPP data port
+    mov     dx, CfgData.Port
+    add     dx, LPT_EPP_DATA
+    
+    ; Read loop with timeout
+    mov     cx, 0FFFFh          ; Timeout counter
+ParISR_ReadLoop:
+    ; Check if data ready (nBusy low = data valid)
+    push    dx
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
+    pop     dx
+    test    al, LPT_STAT_NBUSY
+    jz      ParISR_DataReady    ; nBusy low = data valid
+    dec     cx
+    jnz     ParISR_ReadLoop
+    jmp     ParISR_Done         ; Timeout - no data
+    
+ParISR_DataReady:
+    ; Read the byte from EPP data port
+    in      al, dx
+    
+    ; Process through frame parser
+    call    ProcessReceivedByte
+    
+    ; Check for more data (loop while nACK stays low)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
+    test    al, LPT_STAT_NACK
+    jz      ParISR_ReadLoop     ; More data pending
+    
+ParISR_CheckTx:
+    ; Check if remote signaled "not ready" (their INIT reflects as SELECT status)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
+    test    al, LPT_STAT_ONLINE         ; SELECT/Online bit = remote INIT state
+    jz      ParISR_Done                 ; Remote not ready - don't send
+    
+    ; Check if transmit ready (nBusy high = can send)
+    test    al, LPT_STAT_NBUSY
+    jz      ParISR_Done         ; Busy - can't send now
+    
+    ; Check if we have pending TX data
+    cmp     TxPending, 0
+    je      ParISR_Done         ; No pending transmit
+    
+    ; Send next byte from TX buffer
+    call    ParallelSendNextByte
+    
+ParISR_Done:
+    ; Send EOI to PIC (handle PIC2 for IRQ >= 8)
     mov     al, 20h
-    out     020h, al
+    cmp     CfgData.IRQNum, 8
+    jb      ParISR_EOI1
+    out     0A0h, al            ; EOI to PIC2
+ParISR_EOI1:
+    out     020h, al            ; EOI to PIC1
 
     pop     ds
     pop     dx
+    pop     cx
     pop     bx
     pop     ax
     
     jmp     dword ptr cs:[OldHwInt_Off]
 ParallelISR ENDP
+
+;=============================================================================
+; ParallelSendNextByte - Send next byte from TX buffer via parallel port
+;=============================================================================
+ParallelSendNextByte PROC
+    push    ax
+    push    dx
+    push    si
+    
+    ; Get next byte from TX buffer
+    mov     si, TxOutPtr
+    cmp     si, TxInPtr
+    je      ParSend_Empty       ; Buffer empty
+    
+    mov     al, TxFrameBuffer[si]
+    inc     si
+    cmp     si, TX_BUFFER_SIZE
+    jb      ParSend_NoWrap
+    xor     si, si              ; Wrap around
+ParSend_NoWrap:
+    mov     TxOutPtr, si
+    
+    ; Send byte via EPP data port
+    mov     dx, CfgData.Port
+    add     dx, LPT_EPP_DATA
+    out     dx, al
+    
+    ; Check if buffer now empty
+    mov     si, TxOutPtr
+    cmp     si, TxInPtr
+    jne     ParSend_Done
+    mov     TxPending, 0        ; Clear pending flag
+    
+    ; Complete current ECB if any
+    push    es
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      ParSend_NoECB
+    cmp     word ptr TxCurrentECB+2, 0
+    je      ParSend_NoECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    call    CompleteTransmitECB
+ParSend_NoECB:
+    pop     es
+    jmp     ParSend_Done
+    
+ParSend_Empty:
+    mov     TxPending, 0
+    
+ParSend_Done:
+    pop     si
+    pop     dx
+    pop     ax
+    ret
+ParallelSendNextByte ENDP
 
 ;=============================================================================
 ; ProcessReceivedByte - Process received byte through frame parser FSM
@@ -2714,7 +3388,9 @@ StateIdle:
     jmp     ProcessDone
 
 StateSeq:
-    ; Store sequence number
+    ; Store and validate sequence number (should be 0 or 1)
+    cmp     al, 1               ; Valid seq is 0 or 1
+    ja      FrameError          ; Invalid sequence - reject early
     mov     byte ptr FrameBuffer[0], al
     call    UpdateCRC
     mov     RxState, STATE_LEN_LO
@@ -2733,6 +3409,9 @@ StateLenHi:
     call    UpdateCRC
     mov     ax, word ptr FrameBuffer[1]
     mov     RxFrameLen, ax
+    ; Validate length: must be > 0 and <= MTU_SIZE
+    test    ax, ax
+    jz      FrameError          ; Zero length - reject early
     cmp     ax, MTU_SIZE
     ja      FrameError
     mov     RxState, STATE_DATA
@@ -2775,6 +3454,15 @@ FrameError:
     mov     RxState, STATE_IDLE
     lea     bx, Statistics.CRCErrors
     call    Inc32
+    
+    ; Update ODI checksum error counter
+    inc     word ptr MLIDStatistics.MRxChecksumError
+    adc     word ptr MLIDStatistics.MRxChecksumError+2, 0
+    
+    ; Send NAK to request retransmit (serial mode only)
+    cmp     CfgData.Mode, 0
+    jne     ProcessDone             ; Skip NAK for parallel mode
+    call    SendNAK
 
 ProcessDone:
     pop     di
@@ -2816,11 +3504,46 @@ UpdateCRC ENDP
 ;=============================================================================
 
 CRCTable:
+    ; Entries 0-31
     DW 00000h, 01021h, 02042h, 03063h, 04084h, 050A5h, 060C6h, 070E7h
     DW 08108h, 09129h, 0A14Ah, 0B16Bh, 0C18Ch, 0D1ADh, 0E1CEh, 0F1EFh
     DW 01231h, 00210h, 03273h, 02252h, 052B5h, 04294h, 072F7h, 062D6h
     DW 09339h, 08318h, 0B37Bh, 0A35Ah, 0D3BDh, 0C39Ch, 0F3FFh, 0E3DEh
-    ; ... (remaining 240 entries omitted for brevity - full table needed)
+    ; Entries 32-63
+    DW 02462h, 03443h, 00420h, 01401h, 064E6h, 074C7h, 044A4h, 05485h
+    DW 0A56Ah, 0B54Bh, 08528h, 09509h, 0E5EEh, 0F5CFh, 0C5ACh, 0D58Dh
+    DW 03653h, 02672h, 01611h, 00630h, 076D7h, 066F6h, 05695h, 046B4h
+    DW 0B75Bh, 0A77Ah, 09719h, 08738h, 0F7DFh, 0E7FEh, 0D79Dh, 0C7BCh
+    ; Entries 64-95
+    DW 048C4h, 058E5h, 06886h, 078A7h, 00840h, 01861h, 02802h, 03823h
+    DW 0C9CCh, 0D9EDh, 0E98Eh, 0F9AFh, 08948h, 09969h, 0A90Ah, 0B92Bh
+    DW 05AF5h, 04AD4h, 07AB7h, 06A96h, 01A71h, 00A50h, 03A33h, 02A12h
+    DW 0DBFDh, 0CBDCh, 0FBBFh, 0EB9Eh, 09B79h, 08B58h, 0BB3Bh, 0AB1Ah
+    ; Entries 96-127
+    DW 06CA6h, 07C87h, 04CE4h, 05CC5h, 02C22h, 03C03h, 00C60h, 01C41h
+    DW 0EDFEh, 0FDDFh, 0CDBCh, 0DD9Dh, 0AD7Ah, 0BD5Bh, 08D38h, 09D19h
+    DW 07EC7h, 06EE6h, 05E85h, 04EA4h, 03E43h, 02E62h, 01E01h, 00E20h
+    DW 0FFCFh, 0EFEEh, 0DF8Dh, 0CFACh, 0BF4Bh, 0AF6Ah, 09F09h, 08F28h
+    ; Entries 128-159
+    DW 09188h, 081A9h, 0B1CAh, 0A1EBh, 0D10Ch, 0C12Dh, 0F14Eh, 0E16Fh
+    DW 01080h, 000A1h, 030C2h, 020E3h, 05004h, 04025h, 07046h, 06067h
+    DW 083B9h, 09398h, 0A3FBh, 0B3DAh, 0C33Dh, 0D31Ch, 0E37Fh, 0F35Eh
+    DW 002B1h, 01290h, 022F3h, 032D2h, 04235h, 05214h, 06277h, 07256h
+    ; Entries 160-191
+    DW 0B5EAh, 0A5CBh, 095A8h, 08589h, 0F56Eh, 0E54Fh, 0D52Ch, 0C50Dh
+    DW 034E2h, 024C3h, 014A0h, 00481h, 07466h, 06447h, 05424h, 04405h
+    DW 0A7DBh, 0B7FAh, 08799h, 097B8h, 0E75Fh, 0F77Eh, 0C71Dh, 0D73Ch
+    DW 026D3h, 036F2h, 00691h, 016B0h, 06657h, 07676h, 04615h, 05634h
+    ; Entries 192-223
+    DW 0D94Ch, 0C96Dh, 0F90Eh, 0E92Fh, 099C8h, 089E9h, 0B98Ah, 0A9ABh
+    DW 05844h, 04865h, 07806h, 06827h, 018C0h, 008E1h, 03882h, 028A3h
+    DW 0CB7Dh, 0DB5Ch, 0EB3Fh, 0FB1Eh, 08BF9h, 09BD8h, 0ABBBh, 0BB9Ah
+    DW 04A75h, 05A54h, 06A37h, 07A16h, 00AF1h, 01AD0h, 02AB3h, 03A92h
+    ; Entries 224-255
+    DW 0FD2Eh, 0ED0Fh, 0DD6Ch, 0CD4Dh, 0BDAAh, 0AD8Bh, 09DE8h, 08DC9h
+    DW 07C26h, 06C07h, 05C64h, 04C45h, 03CA2h, 02C83h, 01CE0h, 00CC1h
+    DW 0EF1Fh, 0FF3Eh, 0CF5Dh, 0DF7Ch, 0AF9Bh, 0BFBAh, 08FD9h, 09FF8h
+    DW 06E17h, 07E36h, 04E55h, 05E74h, 02E93h, 03EB2h, 00ED1h, 01EF0h
 
 ;=============================================================================
 ; ValidateFrame - Validate received frame and deliver to LSL
@@ -2905,13 +3628,13 @@ LookAheadOK2:
     mov     RxLookAhead.LookAheadLen, ax
 
     ; LProtID = Protocol ID (for Ethernet_802.2, this is DSAP/SSAP/Control)
-    ; Copy first 6 bytes of data as protocol ID
+    ; Copy first 6 bytes of data as protocol ID (3 words)
     push    si
     push    di
     lea     si, FrameBuffer+3+14    ; Point to data after media header
     lea     di, RxLookAhead.LProtID
-    mov     cx, 6
-    rep     movsb
+    mov     cx, 3
+    rep     movsw
     pop     di
     pop     si
 
@@ -2923,13 +3646,13 @@ LookAheadOK2:
     mov     ax, RxFrameLen
     mov     RxLookAhead.LDataSize, ax
 
-    ; LImmAddress = source MAC address (6 bytes at offset 6)
+    ; LImmAddress = source MAC address (6 bytes = 3 words at offset 6)
     push    si
     push    di
     lea     si, FrameBuffer+3+6     ; Source MAC at offset 6
     lea     di, RxLookAhead.LImmAddress
-    mov     cx, 6
-    rep     movsb
+    mov     cx, 3
+    rep     movsw
     pop     di
     pop     si
 
@@ -3008,8 +3731,11 @@ UseFragSize:
     pop     ds
     lea     si, FrameBuffer+3       ; DS:SI = source packet data
     
-    ; Copy data
-    rep     movsb
+    ; Copy data (use word moves for performance)
+    shr     cx, 1               ; Divide by 2 for word count
+    rep     movsw               ; Copy words
+    adc     cx, cx              ; CX=1 if odd byte remains
+    rep     movsb               ; Copy trailing byte if any
 
 CopyDone:
     ; Restore ECB pointer
@@ -3035,12 +3761,20 @@ CopyDone:
     mov     bx, MLIDSUP_SERVICE_EVENTS   ; 0Bh
     call    dword ptr [LSLInfoBuf.LSLEntryPoint]
 
+    ; Resume remote if we had paused (buffer space now available)
+    cmp     RxPaused, 0
+    je      DeliverDone
+    call    ResumeBackpressure
+
     jmp     DeliverDone
 
 NoECBAvailable:
     ; Update statistics - no ECB available
     inc     word ptr MLIDStatistics.MNoECBsAvailable
     adc     word ptr MLIDStatistics.MNoECBsAvailable+2, 0
+    
+    ; Signal sender to pause (backpressure)
+    call    SendBackpressure
     jmp     DeliverDone
 
 RxTooShort:
@@ -3075,33 +3809,279 @@ SendACK PROC
     
     mov     dx, CfgData.Port
     
-    ; Wait for transmit ready
+    ; Wait for transmit ready with timeout
+    mov     cx, 0FFFFh          ; Timeout counter
 WaitTxReady:
+    push    cx                  ; Preserve counter
     add     dx, UART_LSR
     in      al, dx
-    test    al, 20h
-    jz      WaitTxReady
-
+    test    al, 20h             ; Transmit ready?
+    pop     cx
+    jnz     TxReady1
+    sub     dx, UART_LSR        ; Reset DX for next iteration
+    dec     cx
+    jnz     WaitTxReady
+    jmp     SendACKDone         ; Timeout - abort
+TxReady1:
     ; Send ACK
     sub     dx, UART_LSR
     mov     al, ACK_CHAR
     out     dx, al
 
-    ; Send sequence number
+    ; Send sequence number with timeout
+    mov     cx, 0FFFFh          ; Timeout counter
 WaitTxReady2:
+    push    cx                  ; Preserve counter
     add     dx, UART_LSR
     in      al, dx
-    test    al, 20h
-    jz      WaitTxReady2
-
+    test    al, 20h             ; Transmit ready?
+    pop     cx
+    jnz     TxReady2
+    sub     dx, UART_LSR        ; Reset DX for next iteration
+    dec     cx
+    jnz     WaitTxReady2
+    jmp     SendACKDone         ; Timeout - abort
+TxReady2:
     sub     dx, UART_LSR
     mov     al, ah
     out     dx, al
 
+SendACKDone:
     pop     dx
     pop     ax
     ret
 SendACK ENDP
+
+;=============================================================================
+; SendNAK - Send NAK character requesting retransmission (serial only)
+; Uses NAK_CHAR (0x15) followed by expected sequence number
+;=============================================================================
+SendNAK PROC
+    push    ax
+    push    dx
+    push    cx
+    
+    mov     dx, CfgData.Port
+    
+    ; Wait for transmit ready
+    mov     cx, 0FFFFh
+WaitNAKReady1:
+    push    cx
+    add     dx, UART_LSR
+    in      al, dx
+    test    al, 20h
+    pop     cx
+    jnz     NAKTxReady1
+    sub     dx, UART_LSR
+    dec     cx
+    jnz     WaitNAKReady1
+    jmp     SendNAKDone
+    
+NAKTxReady1:
+    sub     dx, UART_LSR
+    mov     al, NAK_CHAR
+    out     dx, al
+    
+    ; Send expected sequence number
+    mov     cx, 0FFFFh
+WaitNAKReady2:
+    push    cx
+    add     dx, UART_LSR
+    in      al, dx
+    test    al, 20h
+    pop     cx
+    jnz     NAKTxReady2
+    sub     dx, UART_LSR
+    dec     cx
+    jnz     WaitNAKReady2
+    jmp     SendNAKDone
+    
+NAKTxReady2:
+    sub     dx, UART_LSR
+    mov     al, RxSeqNum              ; Send expected seq num
+    out     dx, al
+    
+    ; Update NAK statistics
+    inc     word ptr MLIDStatistics.MTxOKMulticastCount
+    adc     word ptr MLIDStatistics.MTxOKMulticastCount+2, 0
+
+SendNAKDone:
+    pop     cx
+    pop     dx
+    pop     ax
+    ret
+SendNAK ENDP
+
+;=============================================================================
+; Backpressure Flow Control Routines
+; Signal remote to pause/resume when buffers fill/empty
+;=============================================================================
+
+;=============================================================================
+; SendBackpressure - Signal remote to pause (mode-independent dispatcher)
+;=============================================================================
+SendBackpressure PROC
+    push    ax
+    
+    cmp     RxPaused, 1                 ; Already paused?
+    je      BackpressureDone
+    
+    cmp     CfgData.Mode, 0             ; Serial mode?
+    je      BackpressureSerial
+    ; Parallel mode (PAR4 or PAR8)
+    call    ParSendPause
+    jmp     BackpressureDone
+    
+BackpressureSerial:
+    call    SerialSendPause
+    
+BackpressureDone:
+    pop     ax
+    ret
+SendBackpressure ENDP
+
+;=============================================================================
+; ResumeBackpressure - Signal remote to resume (mode-independent dispatcher)
+;=============================================================================
+ResumeBackpressure PROC
+    push    ax
+    
+    cmp     RxPaused, 0                 ; Not paused?
+    je      ResumeDone
+    
+    cmp     CfgData.Mode, 0             ; Serial mode?
+    je      ResumeSerial
+    ; Parallel mode (PAR4 or PAR8)
+    call    ParSendResume
+    jmp     ResumeDone
+    
+ResumeSerial:
+    call    SerialSendResume
+    
+ResumeDone:
+    pop     ax
+    ret
+ResumeBackpressure ENDP
+
+;=============================================================================
+; SerialSendPause - Pause remote via XOFF or lowering RTS (serial mode)
+;=============================================================================
+SerialSendPause PROC
+    push    ax
+    push    dx
+    
+    cmp     CfgData.FlowCtrl, 1         ; XON/XOFF mode?
+    jne     SerialPauseHardware
+    
+    ; Software flow: send XOFF character
+    mov     dx, CfgData.Port
+    add     dx, UART_LSR
+WaitXOFFReady:
+    in      al, dx
+    test    al, 20h                     ; THRE ready?
+    jz      WaitXOFFReady
+    sub     dx, UART_LSR
+    mov     al, XOFF_CHAR
+    out     dx, al
+    jmp     SerialPauseSet
+
+SerialPauseHardware:
+    ; Hardware flow: lower RTS
+    mov     dx, CfgData.Port
+    add     dx, UART_MCR
+    in      al, dx
+    and     al, 0FDh                    ; Clear RTS bit (NOT MCR_RTS)
+    out     dx, al
+
+SerialPauseSet:
+    mov     RxPaused, 1
+    
+    pop     dx
+    pop     ax
+    ret
+SerialSendPause ENDP
+
+;=============================================================================
+; SerialSendResume - Resume remote via XON or raising RTS (serial mode)
+;=============================================================================
+SerialSendResume PROC
+    push    ax
+    push    dx
+    
+    cmp     CfgData.FlowCtrl, 1         ; XON/XOFF mode?
+    jne     SerialResumeHardware
+    
+    ; Software flow: send XON character
+    mov     dx, CfgData.Port
+    add     dx, UART_LSR
+WaitXONReady:
+    in      al, dx
+    test    al, 20h                     ; THRE ready?
+    jz      WaitXONReady
+    sub     dx, UART_LSR
+    mov     al, XON_CHAR
+    out     dx, al
+    jmp     SerialResumeClear
+
+SerialResumeHardware:
+    ; Hardware flow: raise RTS
+    mov     dx, CfgData.Port
+    add     dx, UART_MCR
+    in      al, dx
+    or      al, MCR_RTS                 ; Set RTS bit
+    out     dx, al
+
+SerialResumeClear:
+    mov     RxPaused, 0
+    
+    pop     dx
+    pop     ax
+    ret
+SerialSendResume ENDP
+
+;=============================================================================
+; ParSendPause - Signal remote to pause (parallel mode)
+; Uses INIT line (active low) - lowering it signals "not ready"
+;=============================================================================
+ParSendPause PROC
+    push    ax
+    push    dx
+    
+    ; Lower INIT line to signal "not ready to receive"
+    mov     dx, CfgData.Port
+    add     dx, LPT_CONTROL
+    in      al, dx
+    and     al, 0FBh                    ; Clear INIT bit (NOT LPT_CTRL_INIT)
+    out     dx, al
+    
+    mov     RxPaused, 1
+    
+    pop     dx
+    pop     ax
+    ret
+ParSendPause ENDP
+
+;=============================================================================
+; ParSendResume - Signal remote to resume (parallel mode)
+; Raises INIT line to signal "ready to receive"
+;=============================================================================
+ParSendResume PROC
+    push    ax
+    push    dx
+    
+    ; Raise INIT line to signal "ready to receive"
+    mov     dx, CfgData.Port
+    add     dx, LPT_CONTROL
+    in      al, dx
+    or      al, LPT_CTRL_INIT           ; Set INIT bit
+    out     dx, al
+    
+    mov     RxPaused, 0
+    
+    pop     dx
+    pop     ax
+    ret
+ParSendResume ENDP
 
 ;=============================================================================
 ; MLID Handler Functions
@@ -3232,6 +4212,9 @@ HasPacket:
     mov     word ptr TxCurrentECB+2, es
     mov     TxCurrentSeg, es
     mov     TxCurrentOff, si
+    
+    ; Reset retry counter for new transmission
+    mov     TxRetryCount, 0
 
     ; Build packet frame from ECB fragments
     call    BuildTransmitFrame
@@ -3345,7 +4328,11 @@ BuildFragLoop:
     push    ax
     pop     es
     
-    rep     movsb
+    ; Copy fragment data (use word moves for performance)
+    shr     cx, 1               ; Divide by 2 for word count
+    rep     movsw               ; Copy words
+    adc     cx, cx              ; CX=1 if odd byte remains
+    rep     movsb               ; Copy trailing byte if any
     
     ; Restore
     pop     si
@@ -4153,6 +5140,19 @@ UnloadDriver PROC
     mov     bx, 0006h               ; DeregisterMLID function (6, not 2!)
     call    dword ptr es:[LSLInfoBuf.LSLEntryPoint]
     
+    ; Check for deregistration error
+    test    ax, ax
+    jz      DeregisterOK
+    
+    ; Deregistration failed - print warning and continue
+    push    ax
+    lea     dx, MsgWarnDeregister
+    mov     ah, 09h
+    int     21h
+    pop     ax
+    ; Continue anyway - driver may be partially unloaded
+    
+DeregisterOK:
     ; ===== CALL MLID SHUTDOWN (PERMANENT) =====
     ; Call the TSR's MLIDShutdownProc to clear internal state
     ; CX=0000h indicates permanent shutdown (for cleanup only, already deregistered)
@@ -4217,6 +5217,20 @@ IRQDisabled:
     mov     ax, 252Fh
     int     21h
     pop     ds
+    
+    ; Restore INT 1Ch (timer) if it was hooked for verbose mode
+    mov     es, Unload_TSRSeg
+    mov     ax, es:[OldInt1C_Off]
+    test    ax, ax
+    jz      SkipRestoreTimer        ; Not hooked if OldInt1C_Off == 0
+    mov     dx, ax
+    mov     ax, es:[OldInt1C_Seg]
+    push    ds
+    mov     ds, ax
+    mov     ax, 251Ch
+    int     21h
+    pop     ds
+SkipRestoreTimer:
 
     ; Restore hardware interrupt vector
     ; First get the old vector from TSR
