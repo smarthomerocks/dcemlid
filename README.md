@@ -717,9 +717,77 @@ If one computer has DB25 serial port:
 
 ### Parallel Cable Wiring (DB25)
 
-#### PAR4 Mode (4-bit Standard)
+#### DB25 Parallel Port Pinout Reference
 
-Use any standard bidirectional parallel printer cable. No special wiring required.
+```
+DB25 Male Connector (looking at solder side)
+ ______________________________________________
+|  13  12  11  10   9   8   7   6   5   4   3   2   1  |
+|   o   o   o   o   o   o   o   o   o   o   o   o   o  |
+|    25  24  23  22  21  20  19  18  17  16  15  14   |
+|     o   o   o   o   o   o   o   o   o   o   o   o    |
+|__________________________________________________|
+```
+
+| Pin | Signal Name | Direction | Description |
+|-----|-------------|-----------|-------------|
+| 1 | nSTROBE | Output | Data strobe (active low) |
+| 2 | D0 | I/O | Data bit 0 |
+| 3 | D1 | I/O | Data bit 1 |
+| 4 | D2 | I/O | Data bit 2 |
+| 5 | D3 | I/O | Data bit 3 |
+| 6 | D4 | I/O | Data bit 4 |
+| 7 | D5 | I/O | Data bit 5 |
+| 8 | D6 | I/O | Data bit 6 |
+| 9 | D7 | I/O | Data bit 7 |
+| 10 | nACK | Input | Acknowledge (active low) |
+| 11 | BUSY | Input | Busy |
+| 12 | PE | Input | Paper End / Paper Out |
+| 13 | SELECT | Input | Select |
+| 14 | nAUTOFD | Output | Auto Line Feed (active low) |
+| 15 | nERROR | Input | Error (active low) |
+| 16 | nINIT | Output | Initialize (active low) |
+| 17 | nSELECTIN | Output | Select In (active low) |
+| 18-25 | GND | - | Ground |
+
+#### PAR4 Mode (4-bit LapLink/Interlink Cable)
+
+This is the standard "LapLink" or "Interlink" parallel cable used by DOS file transfer utilities.
+
+```
+DB25 Male          DB25 Male
+Computer A         Computer B
+----------         ----------
+Pin 2  (D0)   ---> Pin 15 (nERROR)
+Pin 3  (D1)   ---> Pin 13 (SELECT)
+Pin 4  (D2)   ---> Pin 12 (PE)
+Pin 5  (D3)   ---> Pin 10 (nACK)
+Pin 6  (D4)   ---> Pin 11 (BUSY)
+Pin 15 (nERROR) <--- Pin 2  (D0)
+Pin 13 (SELECT) <--- Pin 3  (D1)
+Pin 12 (PE)     <--- Pin 4  (D2)
+Pin 10 (nACK)   <--- Pin 5  (D3)
+Pin 11 (BUSY)   <--- Pin 6  (D4)
+Pin 25 (GND)  <---> Pin 25 (GND)
+```
+
+**PAR4 Wiring Table (for building your own cable):**
+
+| Computer A Pin | Wire to Computer B Pin | Signal A → B |
+|----------------|------------------------|--------------|
+| 2 | 15 | D0 → nERROR |
+| 3 | 13 | D1 → SELECT |
+| 4 | 12 | D2 → PE |
+| 5 | 10 | D3 → nACK |
+| 6 | 11 | D4 → BUSY |
+| 10 | 5 | nACK ← D3 |
+| 11 | 6 | BUSY ← D4 |
+| 12 | 4 | PE ← D2 |
+| 13 | 3 | SELECT ← D1 |
+| 15 | 2 | nERROR ← D0 |
+| 25 | 25 | GND ↔ GND |
+
+> **Tip:** This is the same as a standard LapLink/Interlink cable. You can buy one commercially or build it with 11 wires.
 
 #### PAR8 Mode (8-bit EPP/PS2)
 
@@ -727,27 +795,50 @@ Use any standard bidirectional parallel printer cable. No special wiring require
 DB25 Male          DB25 Male
 Computer A         Computer B
 ----------         ----------
-Pin 1 (STROBE) <--> Pin 1 (STROBE)
-Pin 2 (D0)     <--> Pin 15 (ERROR)
-Pin 3 (D1)     <--> Pin 13 (SELECT)
-Pin 4 (D2)     <--> Pin 12 (PE)
-Pin 5 (D3)     <--> Pin 10 (ACK)
-Pin 6 (D4)     <--> Pin 11 (BUSY)
-Pin 7 (D5)     <--> Pin 2 (D0)
-Pin 8 (D6)     <--> Pin 3 (D1)
-Pin 9 (D7)     <--> Pin 4 (D2)
-Pin 10 (ACK)   <--> Pin 5 (D3)
-Pin 11 (BUSY)  <--> Pin 6 (D4)
-Pin 12 (PE)    <--> Pin 7 (D5)
-Pin 13 (SELECT)<--> Pin 8 (D6)
-Pin 14 (AUTOFD)<--> Pin 14 (AUTOFD)
-Pin 15 (ERROR) <--> Pin 9 (D7)
-Pin 16 (INIT)  <--> Pin 16 (INIT)
-Pin 17 (SLCT)  <--> Pin 17 (SLCT)
-Pins 18-25 (GND)   Pins 18-25 (GND)
+Pin 1  (nSTROBE) <--> Pin 1  (nSTROBE)
+Pin 2  (D0)      <--> Pin 15 (nERROR)
+Pin 3  (D1)      <--> Pin 13 (SELECT)
+Pin 4  (D2)      <--> Pin 12 (PE)
+Pin 5  (D3)      <--> Pin 10 (nACK)
+Pin 6  (D4)      <--> Pin 11 (BUSY)
+Pin 7  (D5)      <--> Pin 2  (D0)
+Pin 8  (D6)      <--> Pin 3  (D1)
+Pin 9  (D7)      <--> Pin 4  (D2)
+Pin 10 (nACK)    <--> Pin 5  (D3)
+Pin 11 (BUSY)    <--> Pin 6  (D4)
+Pin 12 (PE)      <--> Pin 7  (D5)
+Pin 13 (SELECT)  <--> Pin 8  (D6)
+Pin 14 (nAUTOFD) <--> Pin 14 (nAUTOFD)
+Pin 15 (nERROR)  <--> Pin 9  (D7)
+Pin 16 (nINIT)   <--> Pin 16 (nINIT)
+Pin 17 (nSELECTIN) <--> Pin 17 (nSELECTIN)
+Pin 25 (GND)     <--> Pin 25 (GND)
 ```
 
-> **Note:** This is a complex cable. Commercial parallel transfer cables (like LapLink or Interlink cables) may work.
+**PAR8 Wiring Table (for building your own cable):**
+
+| Computer A Pin | Wire to Computer B Pin | Notes |
+|----------------|------------------------|-------|
+| 1 | 1 | nSTROBE (directly connected) |
+| 2 | 15 | D0 ↔ nERROR |
+| 3 | 13 | D1 ↔ SELECT |
+| 4 | 12 | D2 ↔ PE |
+| 5 | 10 | D3 ↔ nACK |
+| 6 | 11 | D4 ↔ BUSY |
+| 7 | 2 | D5 ↔ D0 (cross) |
+| 8 | 3 | D6 ↔ D1 (cross) |
+| 9 | 4 | D7 ↔ D2 (cross) |
+| 10 | 5 | nACK ↔ D3 |
+| 11 | 6 | BUSY ↔ D4 |
+| 12 | 7 | PE ↔ D5 |
+| 13 | 8 | SELECT ↔ D6 |
+| 14 | 14 | nAUTOFD (directly connected) |
+| 15 | 9 | nERROR ↔ D7 |
+| 16 | 16 | nINIT (directly connected) |
+| 17 | 17 | nSELECTIN (directly connected) |
+| 18-25 | 18-25 | Ground (connect at least one) |
+
+> **Note:** PAR8 requires 18 wires for full functionality. This is more complex than PAR4 but provides faster transfer speeds on EPP/PS2-capable ports.
 
 ---
 

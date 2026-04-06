@@ -11,6 +11,7 @@
 
 
 .8086                           ; 8086 CPU instructions only
+LOCALS @@                       ; Enable @@ local labels
 
 CODE    SEGMENT
         ASSUME CS:CODE, DS:CODE, ES:CODE, SS:CODE
@@ -25,10 +26,9 @@ DRIVER_VERSION  EQU 0100h               ; Version 1.00
 MTU_SIZE        EQU 576                 ; Maximum Transmission Unit (IPX max)
 
 ; Multiplex and LSL Constants
-MULTIPLEX_ID    EQU 0C0A0h              ; Our multiplex ID
+MULTIPLEX_ID_BASE EQU 0C0A0h            ; Base multiplex ID (board 0=C0A0, 1=C0B0, etc.)
 LSL_CHECK       EQU 0C000h              ; Check if LSL loaded
 LSL_REGISTER    EQU 0C001h              ; Register MLID with LSL
-LSL_GET_CONFIG  EQU 0C003h              ; Get configuration from LSL
 
 ; Frame Protocol Constants
 FRAME_START     EQU 0C0h                ; SLIP-style frame delimiter
@@ -157,14 +157,26 @@ Config STRUC
     FrameType   DW 0005h                ; Frame type ID (default: 802.2)
 Config ENDS
 
-CfgData Config <>
+; Explicitly define config data with initial values
+CfgData     LABEL   BYTE
+CfgMode     DB      0                   ; Mode: Serial
+CfgPort     DW      3F8h                ; Port: COM1
+CfgBaud     DD      115200              ; Baud rate
+CfgFlow     DB      0                   ; Flow control: RTS/CTS
+CfgMac      DB      02h,60h,8Ch,00h,00h,01h  ; MAC: locally administered
+CfgIRQ      DB      04h                 ; IRQ: 4 (COM1)
+CfgUART     DB      0                   ; UART type: 8250
+CfgParMode  DB      0                   ; Parallel mode: EPP
+CfgBoard    DW      0                   ; Board number: 0
+CfgPortSrc  DB      1                   ; Port source: raw address
+CfgFrame    DW      0005h               ; Frame type: 802.2
 
 ; ODI Statistics Structure (per ODI Spec v4.00 page 15-18)
 MLIDStatStructure STRUC
     MStatTableMajorVer    DB 1            ; 00h: Major version (1)
     MStatTableMinorVer    DB 1            ; 01h: Minor version (01) = v1.01
     MNumGenericCounters   DW 14           ; 02h: Number of generic counters
-    MValidCounterMask     DD 0            ; 04h: Which counters are valid (0=all valid)
+    MValidCounterMask     DD 3FFFh        ; 04h: Bits 0-13 set = all 14 counters valid
     MTotalTxPackets       DD 0            ; 08h: Total TX packets
     MTotalRxPackets       DD 0            ; 0Ch: Total RX packets
     MNoECBsAvailable      DD 0            ; 10h: No ECBs available count
@@ -202,9 +214,16 @@ Statistics Stats <>
 
 ; Driver State
 DriverLoaded    DB 0                    ; Flag: driver loaded
+CtlDebugPos     DW 0                    ; Video memory position for debug output
 DriverActive    DB 0                    ; Flag: driver active (not idle)
 RxHandlerOff    DW 0                    ; LSL receive handler offset
 RxHandlerSeg    DW 0                    ; LSL receive handler segment
+
+; Command Line Flags (must be in data section, not between procedures)
+CmdHelp         DB 0                    ; /? flag
+CmdUnload       DB 0                    ; /U flag
+CmdDebug        DB 0                    ; /D flag
+CmdVerbose      DB 0                    ; /V flag
 
 ; Transmit Monitor (for RegisterTxMonitor BX=4)
 TxMonitorOff    DW 0                    ; TX monitor routine offset
@@ -219,6 +238,8 @@ LSLEntryOff     DW 0
 LSLEntrySeg     DW 0
 LSLVersion      DW 0                    ; LSL version (AL=major, AH=minor)
 LSLBoardNum     DW 0                    ; Board number assigned by LSL
+MuxID           DW 0C0A0h               ; Calculated multiplex ID (install check)
+MuxIDInfo       DW 0C0A1h               ; Calculated multiplex ID + 1 (get info)
 
 ; Interrupt Vectors (Off then Seg for correct FAR JMP dword ptr)
 OldInt2F_Off    DW 0
@@ -266,13 +287,19 @@ RxPaused        DB 0                    ; 1 = we signaled pause to remote
 RxPauseThresh   DW 3584                 ; Pause threshold (RX_BUFFER_SIZE - 512)
 RxResumeThresh  DW 1024                 ; Resume threshold (1KB free)
 
+; PAR4 Nibble Mode State
+Par4RxNibble    DB 0                    ; Stored low nibble during receive
+Par4RxHaveNib   DB 0                    ; 1 = have low nibble, waiting for high
+Par4TxNibble    DB 0                    ; 0 = sending low nibble, 1 = sending high
+Par4TxByte      DB 0                    ; Byte being transmitted (for high nibble)
+
 ; Buffers
 RxBuffer        DB RX_BUFFER_SIZE DUP(0)
 TxBuffer        DB TX_BUFFER_SIZE DUP(0)
 FrameBuffer     DB MTU_SIZE+32 DUP(0)   ; Temp frame assembly buffer (extra for headers)
 TxFrameBuffer   DB MTU_SIZE+32 DUP(0)   ; Transmit frame assembly buffer
 
-; LSL Configuration Keywords
+; NET.CFG Configuration Keywords
 CfgKeyMode      DB 'MODE',0
 CfgKeyPort      DB 'PORT',0
 CfgKeyInt       DB 'INT',0
@@ -292,6 +319,21 @@ CfgVal8023      DB 'ETHERNET_802.3',0
 CfgValEthII     DB 'ETHERNET_II',0
 CfgValSNAP      DB 'ETHERNET_SNAP',0
 
+; NET.CFG file parsing data
+NetCfgName      DB 'NET.CFG',0          ; Filename to open
+NetCfgHandle    DW 0                    ; File handle
+NetCfgInSect    DB 0                    ; 1 = currently inside our Link Driver section
+NetCfgFoundSect DB 0                    ; 1 = found matching section (ever)
+NetCfgLineBuf   DB 256 DUP(0)           ; Line buffer for reading
+NetCfgLineLen   DW 0                    ; Length of current line
+CfgKeyLink      DB 'LINK',0             ; "LINK" keyword
+CfgKeyDriver    DB 'DRIVER',0           ; "DRIVER" keyword  
+CfgKeyAddress   DB 'ADDRESS',0          ; "ADDRESS" keyword (for NODE ADDRESS)
+CfgValCOM1      DB 'COM1',0             ; COM1 port name
+CfgValCOM2      DB 'COM2',0             ; COM2 port name
+CfgValCOM3      DB 'COM3',0             ; COM3 port name
+CfgValCOM4      DB 'COM4',0             ; COM4 port name
+
 ; Messages
 MsgBanner       DB 'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10,'$'
 MsgLoaded       DB 'Driver loaded: $'
@@ -302,7 +344,7 @@ MsgPar8PS2      DB 'PAR8-PS2 $'
 MsgPort         DB 'Port=$'
 MsgIRQ          DB ' IRQ=$'
 MsgMAC          DB ' MAC=$'
-MsgBaud         DB ' Baud='
+MsgBaud         DB ' Baud=$'
 MsgBaud9600     DB '9600$'
 MsgBaud19200    DB '19200$'
 MsgBaud38400    DB '38400$'
@@ -331,7 +373,8 @@ MsgWarnCOM34    DB 'WARNING: COM3/COM4 IRQ not specified in NET.CFG.',13,10
 MsgWarnDeregister DB 'WARNING: LSL deregistration failed. Driver may be partially unloaded.',13,10,'$'
 
 MsgErrLSL       DB 'ERROR: LSL not loaded. Load LSL.COM first.',13,10,'$'
-MsgErrConfig    DB 'ERROR: No configuration in NET.CFG. Add Link Driver DCEMLID section.',13,10,'$'
+MsgErrConfig    DB 'ERROR: Link Driver DCEMLID section not found in NET.CFG.',13,10,'$'
+MsgErrNoNetCfg  DB 'ERROR: NET.CFG file not found.',13,10,'$'
 MsgErrLoaded    DB 'ERROR: Driver already loaded.',13,10,'$'
 MsgErrIRQ       DB 'ERROR: IRQ conflict detected.',13,10,'$'
 MsgErrPort      DB 'ERROR: Hardware not detected at specified port.',13,10,'$'
@@ -339,28 +382,18 @@ MsgErrBDAPort   DB 'ERROR: Port not present in BIOS data area.',13,10,'$'
 MsgErrDOS       DB 'ERROR: Requires DOS 5.0 or higher for UMB support.',13,10,'$'
 MsgErrLSLVer    DB 'ERROR: Incompatible LSL version. Requires LSL 2.x, found: $'
 
-MsgDbgPort      DB 'Detecting hardware at port $'
-MsgDbgMode      DB ' mode=$'
-MsgDbgSerial    DB 'SERIAL$'
-MsgDbgPar4      DB 'PAR4$'
-MsgDbgPar8      DB 'PAR8$'
-
-MsgDbgLCR       DB 'LCR port=$'
-MsgDbgWrite     DB ' write=$'
-MsgDbgRead      DB ' read=$'
-MsgDbgOK        DB ' OK',13,10,'$'
-MsgDbgFAIL      DB ' FAIL',13,10,'$'
-MsgDbgTest1     DB 'Test1:$'
-MsgDbgTest2     DB 'Test2:$'
-MsgDbgHwInit    DB 'Hardware init OK',13,10,'$'
-MsgDbgHookIRQ   DB 'Hooking IRQ...$'
-MsgDbgRegLSL    DB 'Registering with LSL...$'
-MsgDbgLSLFail   DB ' failed (AX=$'
-MsgDbgLSLRet    DB ')',13,10,'$'
-MsgDbgLSLVer    DB 'LSL version=$'
-MsgDbgCallLSL   DB 'Calling LSL RegisterMLID...',13,10,'$'
-
 MsgErrLSLReg    DB 'ERROR: LSL registration failed.',13,10,'$'
+
+; Diagnostic messages for config verification
+MsgDiagHdr      DB 13,10,'[CONFIG] Settings from NET.CFG for board $'
+MsgDiagHdr2     DB ':',13,10,'$'
+MsgDiagMode     DB '  Mode: $'
+MsgDiagPort     DB '  Port: $'
+MsgDiagIRQ      DB '  IRQ: $'
+MsgDiagBaud     DB '  Baud: $'
+MsgDiagFlow     DB '  Flow: $'
+MsgDiagMAC      DB '  MAC: $'
+MsgDiagEnd      DB '[/CONFIG]',13,10,'$'
 
 MsgUnloaded     DB 'Driver unloaded successfully.',13,10,'$'
 MsgErrNotLoaded DB 'ERROR: Driver not loaded.',13,10,'$'
@@ -375,8 +408,7 @@ Unload_TSRMode      DB 0
 Unload_TSRIRQNum    DB 0
 
 ; Help Screen
-HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Connection',13,10
-                DB 13,10,'Usage: DCEMLID [/D] [/V] [/U] [/?]',13,10
+HelpText        DB 13,10,'Usage: DCEMLID [/D] [/V] [/U] [/?]',13,10
                 DB 13,10,'  /D  Enable debug output during hardware detection',13,10
                 DB '  /V  Verbose mode - show live statistics',13,10
                 DB '  /U  Unload driver from memory',13,10
@@ -384,8 +416,6 @@ HelpText        DB 13,10,'DCEMLID v1.00 - ODI MLID Driver for Direct Cable Conne
                 DB 13,10,'Configuration is read from NET.CFG. Example:',13,10
                 DB 13,10,'  Link Driver DCEMLID',13,10
                 DB '     PORT COM1           ; or COM2, COM3, COM4 (from BIOS)',13,10
-                DB '     PORT LPT1           ; or LPT2, LPT3 (from BIOS)',13,10
-                DB '     PORT 3F8            ; raw hex address (manual detection)',13,10
                 DB '     INT 4',13,10
                 DB '     MODE SERIAL',13,10
                 DB '     BAUD 115200',13,10
@@ -438,6 +468,12 @@ Main:
         ; All segment registers already point to CS in .COM file
         ; (DOS sets CS=DS=ES=SS before running .COM)
 
+    ; Explicitly initialize command line flags (ensure clean state)
+    mov     byte ptr [CmdHelp], 0
+    mov     byte ptr [CmdUnload], 0
+    mov     byte ptr [CmdDebug], 0
+    mov     byte ptr [CmdVerbose], 0
+
     ; Display banner
     lea     dx, MsgBanner
     mov     ah, 09h
@@ -447,15 +483,16 @@ Main:
     call    ParseCommandLine
 
     ; Check for help option - must work even if driver not loaded
-    cmp     byte ptr [CmdHelp], 1
-    je      ShowHelp
+    ; Use non-zero check for robustness
+    cmp     byte ptr [CmdHelp], 0
+    jne     ShowHelp
 
     ; Check for unload option - must work when driver IS loaded
-    cmp     byte ptr [CmdUnload], 1
-    je      UnloadDriver
+    cmp     byte ptr [CmdUnload], 0
+    jne     UnloadDriver
 
-    ; Get configuration from LSL/NET.CFG (only for installation)
-    call    GetConfigFromLSL
+    ; Get configuration from NET.CFG (only for installation)
+    call    GetConfigFromNetCfg
     jc      ExitError
 
     ; Install driver
@@ -560,15 +597,12 @@ ParseCmdDone:
 ParseCommandLine ENDP
 
 ;=============================================================================
-; GetConfigFromLSL - Retrieve configuration from LSL/NET.CFG
+; GetConfigFromNetCfg - Retrieve configuration from NET.CFG file
 ; Input: None
 ; Output: CF=1 on error, CF=0 on success
 ;=============================================================================
 
-CmdHelp         DB 0
-CmdUnload       DB 0
-CmdDebug        DB 0
-CmdVerbose      DB 0
+; (CmdHelp, CmdUnload, CmdDebug, CmdVerbose moved to main data section)
 
 ; Timer hook for verbose mode statistics
 OldInt1C_Off    DW 0
@@ -576,7 +610,7 @@ OldInt1C_Seg    DW 0
 VerboseTicks    DW 0                ; Counter for tick-based stats display
 VERBOSE_INTERVAL EQU 18 * 5         ; ~5 seconds (18 ticks/sec)
 
-GetConfigFromLSL PROC
+GetConfigFromNetCfg PROC
     push    ax
     push    bx
     push    cx
@@ -592,9 +626,6 @@ GetConfigFromLSL PROC
     mov     word ptr CfgData.BaudRate+2, 1        ; 115200 high word
     mov     CfgData.FlowCtrl, 0         ; RTS/CTS
     mov     CfgData.BoardNum, 0         ; First instance
-    
-    ; Generate random MAC from BIOS timer (may be overridden)
-    call    GenerateRandomMAC
 
     ; Get board number from command line if specified
     mov     si, 80h
@@ -634,25 +665,60 @@ TryBoardNum:
     mov     CfgData.BoardNum, ax
 
 NoBoardNum:
-    ; Call LSL to get configuration
-    ; AX = LSL_GET_CONFIG (0xC003)
-    ; BX = Board number
-    ; ES:SI = Driver name
-    mov     ax, LSL_GET_CONFIG
-    mov     bx, CfgData.BoardNum
-    push    ds
-    pop     es
-    lea     si, DRIVER_NAME
-    int     2Fh
+    ; Open and parse NET.CFG file directly
+    ; Try to open NET.CFG in current directory
+    mov     ax, 3D00h               ; DOS open file, read-only
+    lea     dx, NetCfgName
+    int     21h
+    jc      NoNetCfgFile            ; File not found, fail
     
-    ; Check if configuration found
-    cmp     al, 0
-    jne     NoConfig
+    mov     NetCfgHandle, ax        ; Save file handle
+    mov     NetCfgInSect, 0         ; Not in our section yet
+    mov     NetCfgFoundSect, 0      ; Haven't found our section yet
     
-    ; ES:SI now points to configuration block from NET.CFG
-    ; Parse configuration keywords
-    call    ParseLSLConfig
-    jc      ConfigError
+    ; Read and parse file line by line
+@@readLoop:
+    call    ReadNetCfgLine
+    jc      @@doneReading           ; EOF or error
+    
+    ; Skip empty lines
+    cmp     NetCfgLineLen, 0
+    je      @@readLoop
+    
+    ; Check if line starts with whitespace (indented = keyword in section)
+    lea     si, NetCfgLineBuf
+    mov     al, [si]
+    cmp     al, ' '
+    je      @@checkKeyword
+    cmp     al, 09h                 ; Tab
+    je      @@checkKeyword
+    
+    ; Line starts at column 0 - check for "Link Driver DCEMLID"
+    mov     NetCfgInSect, 0         ; Reset - new section
+    call    CheckLinkDriver
+    jmp     @@readLoop
+    
+@@checkKeyword:
+    ; Only parse keywords if we're in our section
+    cmp     NetCfgInSect, 0
+    je      @@readLoop
+    
+    ; Parse indented keyword
+    call    ParseNetCfgKeyword
+    jmp     @@readLoop
+    
+@@doneReading:
+    ; Close file
+    mov     ah, 3Eh
+    mov     bx, NetCfgHandle
+    int     21h
+    
+    ; Check if we ever found our section (not just currently in it)
+    cmp     NetCfgFoundSect, 0
+    je      NoConfig            ; Section not found, fail
+    
+    ; Print diagnostic output of received configuration
+    call    PrintConfigDiag
 
 ConfigDone:
     clc
@@ -665,10 +731,21 @@ ConfigDone:
     pop     ax
     ret
 
+NoNetCfgFile:
+    ; NET.CFG file not found - fail driver load
+    lea     dx, MsgErrNoNetCfg
+    mov     ah, 09h
+    int     21h
+    stc
+    jmp     ConfigError
+
 NoConfig:
-    ; No configuration in NET.CFG, use defaults
-    clc
-    jmp     ConfigDone
+    ; Link Driver section not found - fail driver load
+    lea     dx, MsgErrConfig
+    mov     ah, 09h
+    int     21h
+    stc
+    jmp     ConfigError
 
 ConfigError:
     stc
@@ -680,15 +757,478 @@ ConfigError:
     pop     bx
     pop     ax
     ret
-GetConfigFromLSL ENDP
+GetConfigFromNetCfg ENDP
 
 ;=============================================================================
-; ParseLSLConfig - Parse LSL configuration block
-; Input: ES:SI = configuration string from LSL
-; Output: CF=1 on error, CF=0 on success
+; PrintConfigDiag - Print all config values for debugging
+; Shows what was parsed from NET.CFG file
 ;=============================================================================
 
-ParseLSLConfig PROC
+PrintConfigDiag PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+
+    ; Header with board number
+    lea     dx, MsgDiagHdr
+    mov     ah, 09h
+    int     21h
+    mov     ax, CfgData.BoardNum
+    call    PrintDecimal
+    lea     dx, MsgDiagHdr2
+    mov     ah, 09h
+    int     21h
+
+    ; Mode
+    lea     dx, MsgDiagMode
+    mov     ah, 09h
+    int     21h
+    xor     ax, ax
+    mov     al, CfgData.Mode
+    cmp     al, 0
+    jne     @@mode1
+    lea     dx, MsgSerial
+    jmp     @@modePrint
+@@mode1:
+    cmp     al, 1
+    jne     @@mode2
+    lea     dx, MsgPar4
+    jmp     @@modePrint
+@@mode2:
+    lea     dx, MsgPar8EPP
+@@modePrint:
+    mov     ah, 09h
+    int     21h
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    ; Port (hex)
+    lea     dx, MsgDiagPort
+    mov     ah, 09h
+    int     21h
+    mov     ax, CfgData.Port
+    call    PrintHexWord
+    mov     dl, 'h'
+    mov     ah, 02h
+    int     21h
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    ; IRQ (decimal)
+    lea     dx, MsgDiagIRQ
+    mov     ah, 09h
+    int     21h
+    xor     ax, ax
+    mov     al, CfgData.IRQNum
+    call    PrintDecimal
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    ; Baud (decimal, only for serial)
+    cmp     CfgData.Mode, 0
+    jne     @@skipBaud
+    lea     dx, MsgDiagBaud
+    mov     ah, 09h
+    int     21h
+    
+    ; Check for common baud rates and print the appropriate string
+    mov     ax, word ptr CfgData.BaudRate
+    mov     bx, word ptr CfgData.BaudRate+2
+    
+    ; 115200 = 0001:C200h (high:low)
+    cmp     bx, 1
+    jne     @@diagChk57600
+    cmp     ax, 0C200h
+    jne     @@diagChk57600
+    lea     dx, MsgBaud115200
+    jmp     @@diagPrintBaud
+    
+@@diagChk57600:
+    ; 57600 = 0000:E100h
+    test    bx, bx
+    jnz     @@diagBaudUnknown
+    cmp     ax, 0E100h
+    jne     @@diagChk38400
+    lea     dx, MsgBaud57600
+    jmp     @@diagPrintBaud
+
+@@diagChk38400:
+    ; 38400 = 0000:9600h
+    cmp     ax, 9600h
+    jne     @@diagChk19200
+    lea     dx, MsgBaud38400
+    jmp     @@diagPrintBaud
+
+@@diagChk19200:
+    ; 19200 = 0000:4B00h
+    cmp     ax, 4B00h
+    jne     @@diagChk9600
+    lea     dx, MsgBaud19200
+    jmp     @@diagPrintBaud
+
+@@diagChk9600:
+    ; 9600 = 0000:2580h
+    cmp     ax, 2580h
+    jne     @@diagBaudUnknown
+    lea     dx, MsgBaud9600
+    jmp     @@diagPrintBaud
+
+@@diagBaudUnknown:
+    ; Print low word as decimal (best effort)
+    mov     ax, word ptr CfgData.BaudRate
+    call    PrintDecimal
+    jmp     @@diagAfterBaud
+
+@@diagPrintBaud:
+    mov     ah, 09h
+    int     21h
+
+@@diagAfterBaud:
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+@@skipBaud:
+
+    ; Flow control
+    lea     dx, MsgDiagFlow
+    mov     ah, 09h
+    int     21h
+    cmp     CfgData.FlowCtrl, 0
+    jne     @@flowXon
+    lea     dx, MsgFlowRTS
+    jmp     @@flowPrint
+@@flowXon:
+    lea     dx, MsgFlowXON
+@@flowPrint:
+    mov     ah, 09h
+    int     21h
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    ; MAC Address (6 bytes as hex)
+    lea     dx, MsgDiagMAC
+    mov     ah, 09h
+    int     21h
+    
+    ; Print each MAC byte
+    lea     si, CfgData.MacAddr
+    mov     cx, 6
+@@macLoop:
+    lodsb
+    call    PrintHexByte
+    cmp     cx, 1
+    je      @@macNoSep
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+@@macNoSep:
+    loop    @@macLoop
+    
+    lea     dx, MsgCRLF
+    mov     ah, 09h
+    int     21h
+
+    ; Footer
+    lea     dx, MsgDiagEnd
+    mov     ah, 09h
+    int     21h
+
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+PrintConfigDiag ENDP
+
+;=============================================================================
+; ReadNetCfgLine - Read one line from NET.CFG file
+; Input: NetCfgHandle = open file handle
+; Output: NetCfgLineBuf = line content, NetCfgLineLen = length
+;         CF=1 on EOF/error, CF=0 on success
+;=============================================================================
+
+ReadNetCfgLine PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    di
+    
+    lea     di, NetCfgLineBuf
+    xor     cx, cx                  ; Line length counter
+    
+@@readChar:
+    ; Read one byte
+    mov     ah, 3Fh
+    mov     bx, NetCfgHandle
+    push    cx
+    mov     cx, 1
+    push    di
+    lea     dx, NetCfgLineBuf+255   ; Temp byte at end of buffer
+    int     21h
+    pop     di
+    pop     cx
+    jc      @@eof
+    cmp     ax, 0                   ; EOF?
+    je      @@eof
+    
+    ; Check character
+    mov     al, NetCfgLineBuf+255
+    cmp     al, 0Dh                 ; CR?
+    je      @@skipCR
+    cmp     al, 0Ah                 ; LF?
+    je      @@endLine
+    cmp     al, ';'                 ; Comment?
+    je      @@skipComment
+    
+    ; Store character if room in buffer
+    cmp     cx, 254
+    jae     @@readChar              ; Skip if buffer full
+    mov     [di], al
+    inc     di
+    inc     cx
+    jmp     @@readChar
+    
+@@skipCR:
+    jmp     @@readChar              ; Ignore CR, wait for LF
+    
+@@skipComment:
+    ; Skip rest of line
+@@skipToEOL:
+    mov     ah, 3Fh
+    mov     bx, NetCfgHandle
+    push    cx
+    mov     cx, 1
+    lea     dx, NetCfgLineBuf+255
+    int     21h
+    pop     cx
+    jc      @@endLine
+    cmp     ax, 0
+    je      @@endLine
+    mov     al, NetCfgLineBuf+255
+    cmp     al, 0Ah
+    jne     @@skipToEOL
+    ; Fall through to end line
+    
+@@endLine:
+    mov     byte ptr [di], 0        ; Null terminate
+    mov     NetCfgLineLen, cx
+    clc
+    jmp     @@done
+    
+@@eof:
+    ; Check if we have partial line
+    cmp     cx, 0
+    je      @@realEOF
+    mov     byte ptr [di], 0        ; Null terminate
+    mov     NetCfgLineLen, cx
+    clc
+    jmp     @@done
+    
+@@realEOF:
+    mov     NetCfgLineLen, 0
+    stc
+    
+@@done:
+    pop     di
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+ReadNetCfgLine ENDP
+
+;=============================================================================
+; CheckLinkDriver - Check if line is "Link Driver DCEMLID [board]"
+; Input: NetCfgLineBuf = line content, CfgData.BoardNum = requested board
+; Output: NetCfgInSect = 1 if match (including board number), 0 otherwise
+;=============================================================================
+
+CheckLinkDriver PROC
+    push    ax
+    push    bx
+    push    cx
+    push    si
+    push    di
+    
+    lea     si, NetCfgLineBuf
+    
+    ; Skip leading whitespace
+    call    SkipWhitespace
+    
+    ; Check for "LINK"
+    lea     di, CfgKeyLink
+    call    CompareKeywordCI
+    jne     @@noMatch
+    
+    ; Skip whitespace
+    call    SkipWhitespace
+    
+    ; Check for "DRIVER"
+    lea     di, CfgKeyDriver
+    call    CompareKeywordCI
+    jne     @@noMatch
+    
+    ; Skip whitespace
+    call    SkipWhitespace
+    
+    ; Check for "DCEMLID"
+    lea     di, DRIVER_NAME
+    call    CompareKeywordCI
+    jne     @@noMatch
+    
+    ; "Link Driver DCEMLID" matched - now check board number
+    ; Skip whitespace after DCEMLID
+    call    SkipWhitespace
+    
+    ; Check what's next: digit, end of line, or comment
+    mov     al, [si]
+    cmp     al, 0                   ; End of string?
+    je      @@boardZero
+    cmp     al, 13                  ; CR?
+    je      @@boardZero
+    cmp     al, 10                  ; LF?
+    je      @@boardZero
+    cmp     al, ';'                 ; Comment?
+    je      @@boardZero
+    
+    ; Check if it's a digit
+    cmp     al, '0'
+    jb      @@boardZero             ; Not a digit, assume board 0
+    cmp     al, '9'
+    ja      @@boardZero             ; Not a digit, assume board 0
+    
+    ; Parse the board number digit
+    sub     al, '0'
+    xor     ah, ah
+    cmp     ax, CfgData.BoardNum    ; Compare with requested board
+    jne     @@noMatch               ; Different board - skip this section
+    jmp     @@match
+    
+@@boardZero:
+    ; No board number specified = board 0
+    cmp     CfgData.BoardNum, 0
+    jne     @@noMatch               ; We want board N, this is board 0
+    
+@@match:
+    mov     NetCfgInSect, 1
+    mov     NetCfgFoundSect, 1      ; Remember we found a matching section
+    jmp     @@done
+    
+@@noMatch:
+    mov     NetCfgInSect, 0         ; Not in matching section (but may have found one earlier)
+    
+@@done:
+    pop     di
+    pop     si
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+CheckLinkDriver ENDP
+
+;=============================================================================
+; SkipWhitespace - Skip spaces and tabs at SI
+; Input: DS:SI = string pointer
+; Output: SI advanced past whitespace
+;=============================================================================
+
+SkipWhitespace PROC
+@@loop:
+    mov     al, [si]
+    cmp     al, ' '
+    je      @@skip
+    cmp     al, 09h
+    je      @@skip
+    ret
+@@skip:
+    inc     si
+    jmp     @@loop
+SkipWhitespace ENDP
+
+;=============================================================================
+; CompareKeywordCI - Case-insensitive keyword comparison
+; Input: DS:SI = source string, DS:DI = keyword (null-terminated)
+; Output: ZF=1 if match, ZF=0 if no match, SI advanced past keyword if match
+;=============================================================================
+
+CompareKeywordCI PROC
+    push    bx
+    push    cx
+    push    di
+    mov     bx, si                  ; Save original SI
+    
+@@cmpLoop:
+    mov     al, [di]
+    test    al, al
+    jz      @@match                 ; End of keyword = match
+    
+    mov     cl, [si]
+    ; Convert both to uppercase
+    cmp     al, 'a'
+    jb      @@noConvAL
+    cmp     al, 'z'
+    ja      @@noConvAL
+    sub     al, 20h
+@@noConvAL:
+    cmp     cl, 'a'
+    jb      @@noConvCL
+    cmp     cl, 'z'
+    ja      @@noConvCL
+    sub     cl, 20h
+@@noConvCL:
+    cmp     al, cl
+    jne     @@noMatch
+    
+    inc     si
+    inc     di
+    jmp     @@cmpLoop
+    
+@@match:
+    ; Check that keyword is followed by whitespace or end
+    mov     al, [si]
+    cmp     al, 0
+    je      @@matchDone
+    cmp     al, ' '
+    je      @@matchDone
+    cmp     al, 09h
+    je      @@matchDone
+    cmp     al, 0Dh
+    je      @@matchDone
+    cmp     al, 0Ah
+    je      @@matchDone
+    ; Keyword is prefix of another word - no match
+    jmp     @@noMatch
+    
+@@matchDone:
+    xor     ax, ax                  ; Set ZF=1
+    pop     di
+    pop     cx
+    pop     bx
+    ret
+    
+@@noMatch:
+    mov     si, bx                  ; Restore original SI
+    or      ax, 1                   ; Clear ZF
+    pop     di
+    pop     cx
+    pop     bx
+    ret
+CompareKeywordCI ENDP
+
+;=============================================================================
+; ParseNetCfgKeyword - Parse a keyword line from NET.CFG
+; Input: NetCfgLineBuf contains indented keyword line
+;=============================================================================
+
+ParseNetCfgKeyword PROC
     push    ax
     push    bx
     push    cx
@@ -696,245 +1236,151 @@ ParseLSLConfig PROC
     push    si
     push    di
     
-    ; Initialize length limit counter
-    mov     cx, MAX_CONFIG_LEN      ; Maximum config string length
-
-ParseLSLLoop:
-    ; Check length limit to prevent runaway parsing
-    dec     cx
-    jz      ParseLSLDone            ; Limit reached - stop parsing
+    lea     si, NetCfgLineBuf
     
-    ; Check for end of configuration
-    mov     al, es:[si]
-    test    al, al
-    jz      ParseLSLDone
+    ; Skip leading whitespace
+    call    SkipWhitespace
     
-    ; Skip spaces
-SkipLSLSpaces:
-    cmp     byte ptr es:[si], ' '
-    jne     NotSpace
-    inc     si
-    dec     cx                      ; Count skipped spaces
-    jz      ParseLSLDone
-    jmp     SkipLSLSpaces
-NotSpace:
-    
-    ; Check for PORT keyword
+    ; Check for "PORT"
     lea     di, CfgKeyPort
-    call    CompareLSLKeyword
-    je      ParseLSLPort
+    call    CompareKeywordCI
+    je      @@parsePort
     
-    ; Check for INT keyword
+    ; Check for "INT"
     lea     di, CfgKeyInt
-    call    CompareLSLKeyword
-    je      ParseLSLInt
+    call    CompareKeywordCI
+    je      @@parseInt
     
-    ; Check for MODE keyword
+    ; Check for "MODE"
     lea     di, CfgKeyMode
-    call    CompareLSLKeyword
-    je      ParseLSLMode
+    call    CompareKeywordCI
+    je      @@parseMode
     
-    ; Check for BAUD keyword
+    ; Check for "BAUD"
     lea     di, CfgKeyBaud
-    call    CompareLSLKeyword
-    je      ParseLSLBaud
+    call    CompareKeywordCI
+    je      @@parseBaud
     
-    ; Check for FLOW keyword
+    ; Check for "FLOW"
     lea     di, CfgKeyFlow
-    call    CompareLSLKeyword
-    je      ParseLSLFlow
+    call    CompareKeywordCI
+    je      @@parseFlow
     
-    ; Check for NODE keyword
+    ; Check for "NODE"
     lea     di, CfgKeyNode
-    call    CompareLSLKeyword
-    je      ParseLSLNode
+    call    CompareKeywordCI
+    je      @@parseNode
     
-    ; Check for FRAME keyword
-    lea     di, CfgKeyFrame
-    call    CompareLSLKeyword
-    je      ParseLSLFrame
+    ; Unknown keyword - ignore
+    jmp     @@done
     
-    ; Unknown keyword, skip to end of line
-    call    SkipToLSLEOL
-    jmp     ParseLSLLoop
-
-ParseLSLPort:
-    ; === Check for COMn / LPTn symbolic names ===
-    ; Read first char
-    mov     al, es:[si]
-    call    ToUpper
-    
-    cmp     al, 'C'
-    je      TryParseCOM
-    cmp     al, 'L'
-    je      TryParseLPT
-    jmp     ParsePortHex        ; Not COM or LPT, try hex
-
-TryParseCOM:
-    ; Check for "OM" after 'C'
-    mov     al, es:[si+1]
-    call    ToUpper
-    cmp     al, 'O'
-    jne     ParsePortHex
-    mov     al, es:[si+2]
-    call    ToUpper
-    cmp     al, 'M'
-    jne     ParsePortHex
-    
-    ; Get port number (1-4)
-    mov     al, es:[si+3]
-    cmp     al, '1'
-    jb      ParsePortHex
-    cmp     al, '4'
-    ja      ParsePortHex
-    
-    ; Valid COM1-4, advance SI past "COMn"
-    add     si, 4
-    sub     al, '1'             ; Convert '1'-'4' to 0-3
-    call    LookupBDACOM
-    jmp     ParseLSLLoop
-
-TryParseLPT:
-    ; Check for "PT" after 'L'
-    mov     al, es:[si+1]
-    call    ToUpper
-    cmp     al, 'P'
-    jne     ParsePortHex
-    mov     al, es:[si+2]
-    call    ToUpper
-    cmp     al, 'T'
-    jne     ParsePortHex
-    
-    ; Get port number (1-3)
-    mov     al, es:[si+3]
-    cmp     al, '1'
-    jb      ParsePortHex
-    cmp     al, '3'
-    ja      ParsePortHex
-    
-    ; Valid LPT1-3, advance SI past "LPTn"
-    add     si, 4
-    sub     al, '1'             ; Convert '1'-'3' to 0-2
-    call    LookupBDALPT
-    jmp     ParseLSLLoop
-
-ParsePortHex:
-    ; Not a symbolic name, parse as hex address (raw)
-    call    ParseLSLHexValue
-    jc      ParseLSLLoop
+@@parsePort:
+    call    SkipWhitespace
+    ; Check for COM1-COM4 names
+    lea     di, CfgValCOM1
+    call    CompareKeywordCI
+    jne     @@chkCOM2
+    mov     CfgData.Port, 3F8h
+    mov     CfgData.IRQNum, 4
+    jmp     @@done
+@@chkCOM2:
+    lea     di, CfgValCOM2
+    call    CompareKeywordCI
+    jne     @@chkCOM3
+    mov     CfgData.Port, 2F8h
+    mov     CfgData.IRQNum, 3
+    jmp     @@done
+@@chkCOM3:
+    lea     di, CfgValCOM3
+    call    CompareKeywordCI
+    jne     @@chkCOM4
+    mov     CfgData.Port, 3E8h
+    mov     CfgData.IRQNum, 4       ; Default, may conflict
+    jmp     @@done
+@@chkCOM4:
+    lea     di, CfgValCOM4
+    call    CompareKeywordCI
+    jne     @@parsePortHex
+    mov     CfgData.Port, 2E8h
+    mov     CfgData.IRQNum, 3       ; Default, may conflict
+    jmp     @@done
+@@parsePortHex:
+    ; Parse as hex value
+    call    ParseHexWord
     mov     CfgData.Port, ax
-    mov     CfgData.PortSource, 1       ; Raw address
-    jmp     ParseLSLLoop
-
-ParseLSLInt:
-    call    ParseLSLDecValue
-    jc      ParseLSLLoop
+    jmp     @@done
+    
+@@parseInt:
+    call    SkipWhitespace
+    call    ParseDecimalByte
     mov     CfgData.IRQNum, al
-    jmp     ParseLSLLoop
-
-ParseLSLMode:
+    jmp     @@done
+    
+@@parseMode:
+    call    SkipWhitespace
     lea     di, CfgValSerial
-    call    CompareLSLValue
-    je      SetModeSerial
-    lea     di, CfgValPar4
-    call    CompareLSLValue
-    je      SetModePar4
-    lea     di, CfgValPar8
-    call    CompareLSLValue
-    je      SetModePar8
-    jmp     ParseLSLLoop
-
-SetModeSerial:
+    call    CompareKeywordCI
+    jne     @@chkPar4
     mov     CfgData.Mode, 0
-    jmp     ParseLSLLoop
-
-SetModePar4:
+    jmp     @@done
+@@chkPar4:
+    lea     di, CfgValPar4
+    call    CompareKeywordCI
+    jne     @@chkPar8
     mov     CfgData.Mode, 1
-    mov     CfgData.Port, 378h          ; Default LPT1
-    jmp     ParseLSLLoop
-
-SetModePar8:
+    jmp     @@done
+@@chkPar8:
+    lea     di, CfgValPar8
+    call    CompareKeywordCI
+    jne     @@done
     mov     CfgData.Mode, 2
-    mov     CfgData.Port, 378h          ; Default LPT1
-    jmp     ParseLSLLoop
-
-ParseLSLBaud:
-    call    ParseLSLDecValue
-    jc      ParseLSLLoop
+    jmp     @@done
+    
+@@parseBaud:
+    call    SkipWhitespace
+    call    ParseDecimalDword
     mov     word ptr CfgData.BaudRate, ax
-    mov     word ptr CfgData.BaudRate+2, 0
-    jmp     ParseLSLLoop
-
-ParseLSLFlow:
+    mov     word ptr CfgData.BaudRate+2, dx
+    jmp     @@done
+    
+@@parseFlow:
+    call    SkipWhitespace
     lea     di, CfgValRTS
-    call    CompareLSLValue
-    je      SetFlowRTS
-    lea     di, CfgValXON
-    call    CompareLSLValue
-    je      SetFlowXON
-    jmp     ParseLSLLoop
-
-SetFlowRTS:
+    call    CompareKeywordCI
+    jne     @@chkXON
     mov     CfgData.FlowCtrl, 0
-    jmp     ParseLSLLoop
-
-SetFlowXON:
+    jmp     @@done
+@@chkXON:
+    lea     di, CfgValXON
+    call    CompareKeywordCI
+    jne     @@done
     mov     CfgData.FlowCtrl, 1
-    jmp     ParseLSLLoop
-
-ParseLSLNode:
-    ; Parse NODE ADDRESS xxxxxxxxxxxx (12 hex digits)
-    ; Skip "ADDRESS" keyword
-    call    SkipLSLWord
-    ; Parse 12 hex digits for MAC address
-    lea     di, CfgData.MacAddr
-    mov     cx, 6
-ParseLSLNodeLoop:
-    call    ParseLSLHexByte
-    jc      ParseLSLLoop
-    stosb
-    loop    ParseLSLNodeLoop
-    jmp     ParseLSLLoop
-
-ParseLSLFrame:
-    ; Parse FRAME type value
-    lea     di, CfgVal8022
-    call    CompareLSLValue
-    je      SetFrame8022
+    jmp     @@done
     
-    lea     di, CfgVal8023
-    call    CompareLSLValue
-    je      SetFrame8023
+@@parseNode:
+    call    SkipWhitespace
+    ; Skip "ADDRESS" keyword if present
+    lea     di, CfgKeyAddress
+    call    CompareKeywordCI
+    call    SkipWhitespace
     
-    lea     di, CfgValEthII
-    call    CompareLSLValue
-    je      SetFrameEthII
+    ; Parse 6 hex bytes for MAC - explicit direct addressing
+    ; Avoids any loop/register interference issues
+    call    ParseHexByte
+    mov     CfgData.MacAddr[0], al
+    call    ParseHexByte
+    mov     CfgData.MacAddr[1], al
+    call    ParseHexByte
+    mov     CfgData.MacAddr[2], al
+    call    ParseHexByte
+    mov     CfgData.MacAddr[3], al
+    call    ParseHexByte
+    mov     CfgData.MacAddr[4], al
+    call    ParseHexByte
+    mov     CfgData.MacAddr[5], al
+    jmp     @@done
     
-    lea     di, CfgValSNAP
-    call    CompareLSLValue
-    je      SetFrameSNAP
-    
-    ; Unknown frame type - ignore
-    jmp     ParseLSLLoop
-
-SetFrame8022:
-    mov     CfgData.FrameType, 0005h    ; Ethernet 802.2
-    jmp     ParseLSLLoop
-
-SetFrame8023:
-    mov     CfgData.FrameType, 0002h    ; Ethernet 802.3
-    jmp     ParseLSLLoop
-
-SetFrameEthII:
-    mov     CfgData.FrameType, 0004h    ; Ethernet II
-    jmp     ParseLSLLoop
-
-SetFrameSNAP:
-    mov     CfgData.FrameType, 000Ah    ; Ethernet SNAP
-    jmp     ParseLSLLoop
-
-ParseLSLDone:
-    clc
+@@done:
     pop     di
     pop     si
     pop     dx
@@ -942,182 +1388,194 @@ ParseLSLDone:
     pop     bx
     pop     ax
     ret
-ParseLSLConfig ENDP
+ParseNetCfgKeyword ENDP
 
-; Helper: Compare keyword at ES:SI with DS:DI
-CompareLSLKeyword PROC
-    push    si
-    push    di
-CompLSLKeyLoop:
-    mov     al, [di]
-    test    al, al
-    jz      CompLSLKeyMatch
-    mov     ah, es:[si]
-    call    ToUpper
-    xchg    al, ah
-    call    ToUpper
-    cmp     al, ah
-    jne     CompLSLKeyNoMatch
-    inc     si
-    inc     di
-    jmp     CompLSLKeyLoop
-CompLSLKeyMatch:
-    pop     di
-    pop     si
-    ; Advance SI past keyword
-    add     si, di
-    sub     si, offset CfgKeyMode
-    xor     al, al              ; Set ZF
-    ret
-CompLSLKeyNoMatch:
-    pop     di
-    pop     si
-    or      al, 1               ; Clear ZF
-    ret
-CompareLSLKeyword ENDP
+;=============================================================================
+; ParseHexWord - Parse hex word from string
+; Input: DS:SI = string pointer
+; Output: AX = parsed value, SI advanced
+;=============================================================================
 
-; Helper: Compare value at ES:SI with DS:DI
-CompareLSLValue PROC
-    push    si
-    push    di
-CompLSLValLoop:
-    mov     al, [di]
-    test    al, al
-    jz      CompLSLValMatch
-    mov     ah, es:[si]
-    cmp     ah, ' '
-    je      CompLSLValMatch
-    cmp     ah, 13
-    je      CompLSLValMatch
-    cmp     ah, 10
-    je      CompLSLValMatch
-    call    ToUpper
-    xchg    al, ah
-    call    ToUpper
-    cmp     al, ah
-    jne     CompLSLValNoMatch
-    inc     si
-    inc     di
-    jmp     CompLSLValLoop
-CompLSLValMatch:
-    pop     di
-    pop     si
-    add     si, di
-    sub     si, offset CfgValSerial
-    xor     al, al
-    ret
-CompLSLValNoMatch:
-    pop     di
-    pop     si
-    or      al, 1
-    ret
-CompareLSLValue ENDP
-
-; Helper: Parse hex value from ES:SI
-ParseLSLHexValue PROC
+ParseHexWord PROC
     push    bx
-    xor     bx, bx
-    mov     cx, 4
-ParseLSLHexLoop:
-    mov     al, es:[si]
-    call    HexDigitToValue
-    jc      ParseLSLHexDone
-    mov     cl, 4
-    shl     bx, cl
-    or      bl, al
+    push    cx
+    xor     ax, ax
+    mov     cx, 4                   ; Max 4 hex digits
+
+@@loop:
+    mov     bl, [si]
+    
+    ; Check for 0-9
+    cmp     bl, '0'
+    jb      @@done
+    cmp     bl, '9'
+    ja      @@chkAF
+    sub     bl, '0'
+    jmp     @@addDigit
+    
+@@chkAF:
+    ; Check for A-F
+    cmp     bl, 'A'
+    jb      @@chkLower
+    cmp     bl, 'F'
+    ja      @@chkLower
+    sub     bl, 'A' - 10
+    jmp     @@addDigit
+    
+@@chkLower:
+    ; Check for a-f
+    cmp     bl, 'a'
+    jb      @@done
+    cmp     bl, 'f'
+    ja      @@done
+    sub     bl, 'a' - 10
+    
+@@addDigit:
+    shl     ax, 4
+    xor     bh, bh
+    or      ax, bx
     inc     si
-    loop    ParseLSLHexLoop
-ParseLSLHexDone:
-    mov     ax, bx
-    clc
+    loop    @@loop
+    
+@@done:
+    pop     cx
     pop     bx
     ret
-ParseLSLHexValue ENDP
+ParseHexWord ENDP
 
-; Helper: Parse decimal value from ES:SI
-ParseLSLDecValue PROC
+;=============================================================================
+; ParseHexByte - Parse hex byte from string (2 digits)
+; Input: DS:SI = string pointer
+; Output: AL = parsed value, SI advanced
+;=============================================================================
+
+ParseHexByte PROC
     push    bx
-    push    dx
-    xor     bx, bx
-ParseLSLDecLoop:
-    mov     al, es:[si]
-    cmp     al, '0'
-    jb      ParseLSLDecDone
-    cmp     al, '9'
-    ja      ParseLSLDecDone
-    sub     al, '0'
-    mov     dx, 10
-    push    ax
-    mov     ax, bx
-    mul     dx
-    mov     bx, ax
-    pop     ax
-    add     bx, ax
+    push    cx
+    xor     ax, ax
+    mov     cx, 2                   ; Max 2 hex digits
+
+@@loop:
+    mov     bl, [si]
+    
+    ; Check for 0-9
+    cmp     bl, '0'
+    jb      @@done
+    cmp     bl, '9'
+    ja      @@chkAF
+    sub     bl, '0'
+    jmp     @@addDigit
+    
+@@chkAF:
+    ; Check for A-F
+    cmp     bl, 'A'
+    jb      @@chkLower
+    cmp     bl, 'F'
+    ja      @@chkLower
+    sub     bl, 'A' - 10
+    jmp     @@addDigit
+    
+@@chkLower:
+    ; Check for a-f
+    cmp     bl, 'a'
+    jb      @@done
+    cmp     bl, 'f'
+    ja      @@done
+    sub     bl, 'a' - 10
+    
+@@addDigit:
+    shl     al, 4
+    xor     bh, bh
+    or      al, bl
     inc     si
-    jmp     ParseLSLDecLoop
-ParseLSLDecDone:
-    mov     ax, bx
-    clc
-    pop     dx
+    loop    @@loop
+    
+@@done:
+    pop     cx
     pop     bx
     ret
-ParseLSLDecValue ENDP
+ParseHexByte ENDP
 
-; Helper: Parse hex byte from ES:SI
-ParseLSLHexByte PROC
+;=============================================================================
+; ParseDecimalByte - Parse decimal byte from string
+; Input: DS:SI = string pointer  
+; Output: AL = parsed value, SI advanced
+;=============================================================================
+
+ParseDecimalByte PROC
     push    bx
-    xor     ah, ah
-    mov     bl, 2
-ParseLSLHexByteLoop:
-    mov     al, es:[si]
-    call    HexDigitToValue
-    jc      ParseLSLHexByteDone
-    mov     cl, 4
-    shl     ah, cl
-    or      ah, al
+    push    cx
+    xor     ax, ax
+    
+@@loop:
+    mov     bl, [si]
+    cmp     bl, '0'
+    jb      @@done
+    cmp     bl, '9'
+    ja      @@done
+    
+    ; AX = AX * 10 + digit
+    mov     cl, 10
+    mul     cl
+    sub     bl, '0'
+    xor     bh, bh
+    add     ax, bx
     inc     si
-    dec     bl
-    jnz     ParseLSLHexByteLoop
-ParseLSLHexByteDone:
-    mov     al, ah
-    clc
+    jmp     @@loop
+    
+@@done:
+    pop     cx
     pop     bx
     ret
-ParseLSLHexByte ENDP
+ParseDecimalByte ENDP
 
-; Helper: Skip to end of line
-SkipToLSLEOL PROC
-SkipLSLEOLLoop:
-    mov     al, es:[si]
-    cmp     al, 13
-    je      SkipLSLEOLDone
-    cmp     al, 10
-    je      SkipLSLEOLDone
-    test    al, al
-    jz      SkipLSLEOLDone
-    inc     si
-    jmp     SkipLSLEOLLoop
-SkipLSLEOLDone:
-    ret
-SkipToLSLEOL ENDP
+;=============================================================================
+; ParseDecimalDword - Parse decimal dword from string
+; Input: DS:SI = string pointer
+; Output: DX:AX = parsed value, SI advanced
+;=============================================================================
 
-; Helper: Skip one word
-SkipLSLWord PROC
-SkipLSLWordLoop:
-    mov     al, es:[si]
-    cmp     al, ' '
-    je      SkipLSLWordDone
-    cmp     al, 13
-    je      SkipLSLWordDone
-    cmp     al, 10
-    je      SkipLSLWordDone
-    test    al, al
-    jz      SkipLSLWordDone
+ParseDecimalDword PROC
+    push    bx
+    push    cx
+    xor     ax, ax
+    xor     dx, dx
+    
+@@loop:
+    mov     bl, [si]
+    cmp     bl, '0'
+    jb      @@done
+    cmp     bl, '9'
+    ja      @@done
+    
+    ; DX:AX = DX:AX * 10 + digit
+    ; Multiply by 10: *2, save, *4 more (total *8), add saved *2
+    shl     ax, 1
+    rcl     dx, 1               ; DX:AX * 2
+    push    dx                  ; Save *2 high
+    push    ax                  ; Save *2 low
+    shl     ax, 1
+    rcl     dx, 1               ; DX:AX * 4
+    shl     ax, 1
+    rcl     dx, 1               ; DX:AX * 8
+    pop     cx                  ; Get *2 low
+    add     ax, cx              ; Add to *8 low
+    pop     cx                  ; Get *2 high
+    adc     dx, cx              ; Add to *8 high with carry = *10
+    
+    ; Add digit
+    sub     bl, '0'
+    xor     bh, bh
+    add     ax, bx
+    adc     dx, 0
     inc     si
-    jmp     SkipLSLWordLoop
-SkipLSLWordDone:
+    jmp     @@loop
+    
+@@done:
+    pop     cx
+    pop     bx
     ret
-SkipLSLWord ENDP
+ParseDecimalDword ENDP
 
 ;=============================================================================
 ; Helper Procedures for Command Line Parsing
@@ -1156,88 +1614,6 @@ ToUpperDone:
     ret
 ToUpper ENDP
 
-ParseHexWord PROC
-    ; Parse hex word at SI, return in AX
-    ; Updates SI and CX
-    push    bx
-    push    dx
-    xor     ax, ax
-    xor     bx, bx
-    mov     dl, 4               ; Max 4 hex digits
-ParseHexLoop:
-    mov     al, [si]
-    call    HexDigitToValue
-    jc      ParseHexDone
-    
-    push    cx              ; Save outer loop counter
-    mov     cl, 4
-    shl     bx, cl
-    pop     cx              ; Restore outer loop counter
-    or      bl, al
-    inc     si
-    dec     cx
-    dec     dl
-    jnz     ParseHexLoop
-
-ParseHexDone:
-    mov     ax, bx
-    clc
-    pop     dx
-    pop     bx
-    ret
-ParseHexWord ENDP
-
-ParseHexByte PROC
-    ; Parse hex byte at SI, return in AL
-    push    bx
-    xor     bx, bx
-    mov     bl, 2               ; Max 2 hex digits
-ParseHexByteLoop:
-    mov     al, [si]
-    call    HexDigitToValue
-    jc      ParseHexByteDone
-    
-    push    cx              ; Save outer loop counter
-    mov     cl, 4
-    shl     ah, cl
-    pop     cx              ; Restore outer loop counter
-    or      ah, al
-    inc     si
-    dec     cx
-    dec     bl
-    jnz     ParseHexByteLoop
-
-ParseHexByteDone:
-    mov     al, ah
-    clc
-    pop     bx
-    ret
-ParseHexByte ENDP
-
-HexDigitToValue PROC
-    ; Convert hex digit in AL to value (0-15)
-    ; CF=1 if not a hex digit
-    cmp     al, '0'
-    jb      HexNotDigit
-    cmp     al, '9'
-    jbe     HexIsDigit
-    call    ToUpper
-    cmp     al, 'A'
-    jb      HexNotDigit
-    cmp     al, 'F'
-    ja      HexNotDigit
-    sub     al, 'A' - 10
-    clc
-    ret
-HexIsDigit:
-    sub     al, '0'
-    clc
-    ret
-HexNotDigit:
-    stc
-    ret
-HexDigitToValue ENDP
-
 ParseDecWord PROC
     ; Parse decimal word at SI, return in AX
     push    bx
@@ -1271,31 +1647,6 @@ ParseDecDone:
     pop     bx
     ret
 ParseDecWord ENDP
-
-GenerateRandomMAC PROC
-    ; Generate random MAC using BIOS timer tick
-    push    es
-    xor     ax, ax
-    mov     es, ax
-    mov     ax, es:[046Ch]      ; BIOS timer tick low word
-    mov     CfgData.MacAddr[0], ah
-    mov     CfgData.MacAddr[1], al
-    mov     ax, es:[046Eh]      ; BIOS timer tick high word
-    mov     CfgData.MacAddr[2], ah
-    mov     CfgData.MacAddr[3], al
-    
-    ; Add some entropy from other BIOS data area values
-    mov     ax, es:[0040h]
-    mov     CfgData.MacAddr[4], ah
-    mov     CfgData.MacAddr[5], al
-    
-    ; Ensure locally administered, unicast MAC
-    and     CfgData.MacAddr[0], 0FEh
-    or      CfgData.MacAddr[0], 02h
-    
-    pop     es
-    ret
-GenerateRandomMAC ENDP
 
 ;=============================================================================
 ; LookupBDACOM - Look up COM port address from BIOS Data Area
@@ -1406,9 +1757,45 @@ IODelay ENDP
 ;=============================================================================
 
 InstallDriver PROC
-    ; Check if already loaded
-    mov     ax, MULTIPLEX_ID
+    ; Calculate multiplex ID for this board: C0A0 + (board * 10h)
+    ; Board 0=C0A0, Board 1=C0B0, Board 2=C0C0, etc.
+    mov     ax, CfgData.BoardNum
+    shl     ax, 4                   ; * 16
+    add     ax, MULTIPLEX_ID_BASE
+    mov     MuxID, ax
+    push    ax                      ; Save calculated MuxID on stack
+    inc     ax
+    mov     MuxIDInfo, ax
+    
+    ; Check if this specific board is already loaded
+    pop     ax                      ; Retrieve MuxID from stack
+    sti                             ; Ensure interrupts enabled
     int     2Fh
+    ; ----------------------------------------------------------------------
+    ; HACK: INT 21h Backspace/Space/Backspace after INT 2Fh multiplex check
+    ;
+    ; Without this sequence, loading a second board instance (e.g. DCEMLID 1)
+    ; incorrectly reports "Driver already loaded" even though the multiplex ID
+    ; is unique and not in use. This workaround mimics the effect of debug
+    ; output (which made the bug disappear) and is the only reliable fix found.
+    ;
+    ; The cause is likely a subtle register, stack, or interrupt chain issue
+    ; in the DOSBox-X or MS-DOS environment, possibly related to how INT 2Fh
+    ; handlers are chained or how the multiplex check is performed. No amount
+    ; of register saving/restoring or alternate DOS calls (Get Date, Get Version)
+    ; worked reliably—only this exact sequence does.
+    ;
+    ; DO NOT REMOVE unless you have a tested, working alternative!
+    ;
+    push    ax                      ; Save INT 2Fh return value
+    mov     ah, 02h                 ; DOS: Print Character
+    mov     dl, 08h                 ; Backspace (invisible)
+    int     21h
+    mov     dl, ' '                 ; Space
+    int     21h
+    mov     dl, 08h                 ; Backspace (erases the space)
+    int     21h
+    pop     ax                      ; Restore INT 2Fh return value
     cmp     al, 0FFh
     je      AlreadyLoaded
 
@@ -1421,9 +1808,7 @@ InstallDriver PROC
     ; LSL 2.x returns:
     ; AL = FFh (loaded)
     ; ES:BX = pointer to LSL function table (entry point)
-    ; CX or DX may contain version in some implementations
-    ;
-    ; Save registers immediately before any debug code modifies them
+    ; SAVE ES:BX IMMEDIATELY - DOS calls will trash them!
     mov     LSLEntrySeg, es
     mov     LSLEntryOff, bx
     
@@ -1441,9 +1826,6 @@ InstallDriver PROC
     cmp     al, 5
     jb      DOSTooOld
 
-    ; Print settings before hardware detection
-    call    PrintDetectionInfo
-
     ; Initialize hardware based on mode
     cmp     CfgData.Mode, 0
     je      InitSerial
@@ -1459,16 +1841,6 @@ InstallDriver PROC
 InitSerial:
     call    InitSerialPort
     jc      InitError
-    
-    ; Debug: hardware init completed
-    cmp     CmdDebug, 1
-    jne     SkipDbgHwInit
-    push    dx
-    lea     dx, MsgDbgHwInit
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgHwInit:
     jmp     HardwareInitDone
 
 InitParallel:
@@ -1495,39 +1867,9 @@ HardwareInitDone:
     int     21h
     pop     ds
 
-    ; Debug: hooking IRQ
-    cmp     CmdDebug, 1
-    jne     SkipDbgHookIRQ
-    push    dx
-    lea     dx, MsgDbgHookIRQ
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgHookIRQ:
-
     ; Hook hardware interrupt
     call    HookHardwareInterrupt
     jc      InitError
-    
-    ; Debug: print OK
-    cmp     CmdDebug, 1
-    jne     SkipDbgIRQOK
-    push    dx
-    lea     dx, MsgDbgOK
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgIRQOK:
-
-    ; Debug: registering with LSL
-    cmp     CmdDebug, 1
-    jne     SkipDbgRegLSL
-    push    dx
-    lea     dx, MsgDbgRegLSL
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgRegLSL:
 
     ; Register with LSL
     call    RegisterWithLSL
@@ -1661,24 +2003,6 @@ UARTDetectRetry:
     mov     dx, CfgData.Port    ; Reset DX in case of retry
     add     dx, UART_LCR        ; Line Control Register
     
-    ; Debug: print LCR port address
-    cmp     CmdDebug, 1
-    jne     SkipDbgLCR
-    push    ax
-    push    dx                  ; Save LCR port address
-    push    dx                  ; Will use this for PrintHexWord
-    lea     dx, MsgDbgLCR
-    mov     ah, 09h
-    int     21h
-    pop     ax                  ; Get port address into AX for printing
-    call    PrintHexWord
-    lea     dx, MsgCRLF
-    mov     ah, 09h
-    int     21h
-    pop     dx                  ; Restore LCR port address
-    pop     ax
-SkipDbgLCR:
-    
     in      al, dx              ; Save current LCR value
     call    IODelay             ; Allow register to settle
     mov     ah, al              ; Store in AH
@@ -1695,54 +2019,8 @@ SkipDbgLCR:
     mov     bh, al              ; Save masked read
     pop     ax                  ; Restore written value
     
-    ; Debug: print test 1 results
-    cmp     CmdDebug, 1
-    jne     SkipDbgTest1
-    push    ax
-    push    bx
-    push    dx
-    lea     dx, MsgDbgTest1
-    mov     ah, 09h
-    int     21h
-    lea     dx, MsgDbgWrite
-    mov     ah, 09h
-    int     21h
-    mov     al, 01Bh
-    call    PrintHexByte
-    lea     dx, MsgDbgRead
-    mov     ah, 09h
-    int     21h
-    pop     dx
-    pop     bx
-    push    bx
-    push    dx
-    mov     al, bl              ; Raw read value
-    call    PrintHexByte
-    mov     dl, '('
-    mov     ah, 02h
-    int     21h
-    mov     al, bh              ; Masked value
-    call    PrintHexByte
-    mov     dl, ')'
-    mov     ah, 02h
-    int     21h
-    pop     dx
-    pop     bx
-    pop     ax
-SkipDbgTest1:
-    
     cmp     bh, 01Bh
-    jne     NoUARTFoundDbg
-    
-    ; Debug: print OK
-    cmp     CmdDebug, 1
-    jne     SkipDbgOK1
-    push    dx
-    lea     dx, MsgDbgOK
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgOK1:
+    jne     NoUARTRetry
     
     ; Test pattern 2
     mov     al, 003h            ; Test pattern 2 (8N1)
@@ -1756,70 +2034,13 @@ SkipDbgOK1:
     mov     bh, al              ; Save masked read
     pop     ax
     
-    ; Debug: print test 2 results
-    cmp     CmdDebug, 1
-    jne     SkipDbgTest2
-    push    ax
-    push    bx
-    push    dx
-    lea     dx, MsgDbgTest2
-    mov     ah, 09h
-    int     21h
-    lea     dx, MsgDbgWrite
-    mov     ah, 09h
-    int     21h
-    mov     al, 003h
-    call    PrintHexByte
-    lea     dx, MsgDbgRead
-    mov     ah, 09h
-    int     21h
-    pop     dx
-    pop     bx
-    push    bx
-    push    dx
-    mov     al, bl
-    call    PrintHexByte
-    mov     dl, '('
-    mov     ah, 02h
-    int     21h
-    mov     al, bh
-    call    PrintHexByte
-    mov     dl, ')'
-    mov     ah, 02h
-    int     21h
-    pop     dx
-    pop     bx
-    pop     ax
-SkipDbgTest2:
-    
     cmp     bh, 003h
-    jne     NoUARTFoundDbg
-    
-    ; Debug: print OK
-    cmp     CmdDebug, 1
-    jne     SkipDbgOK2
-    push    dx
-    lea     dx, MsgDbgOK
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgOK2:
+    jne     NoUARTRetry
     
     ; Restore original LCR
     mov     al, ah
     out     dx, al
     jmp     UARTDetected
-
-NoUARTFoundDbg:
-    ; Debug: print FAIL
-    cmp     CmdDebug, 1
-    jne     NoUARTRetry
-    push    dx
-    lea     dx, MsgDbgFAIL
-    mov     ah, 09h
-    int     21h
-    pop     dx
-    jmp     NoUARTRetry
 
 NoUARTRetry:
     ; Check if we should retry
@@ -2379,11 +2600,12 @@ MLIDConfig STRUC
     SourceRouteHandler      DD ?            ; 40h: Far ptr to source route handler
     LookAheadSize           DW ?            ; 44h: Lookahead size
     LineSpeed               DW ?            ; 46h: Line speed (Mbps or Kbps+8000h)
-    QueueDepth              DW ?            ; 48h: Queue depth
-    Reserved2               DB 6 DUP(?)     ; 4Ah: Reserved
+    Reserved1_6             DB 6 DUP(?)     ; 48h: Reserved (6 bytes per ODI spec)
+    PrioritySup             DB ?            ; 4Eh: Priority support (0-7 levels)
+    BusID                   DB ?            ; 4Fh: Bus ID (0=ISA, FFh=default)
     DriverMajorVer          DB ?            ; 50h: Driver major version
     DriverMinorVer          DB ?            ; 51h: Driver minor version
-    BusMulticastFlags       DW ?            ; 52h: Bus/multicast flags
+    MFlags                  DW ?            ; 52h: Mode flags (multicast, etc.)
     SendRetries             DW ?            ; 54h: Send retries
     ConfigTableLink         DD ?            ; 56h: Config table link
     SharingFlags            DW ?            ; 5Ah: MLID sharing flags
@@ -2483,7 +2705,8 @@ MLIDFunctions   MLIDFuncTable <>
 
 ; MLID Configuration Table - initialized with signature
 ; Note: '>' is default initializer followed by per-field values
-MLIDConfigTable MLIDConfig <'HardwareDriverMLID        ', 01h, 00h>
+; Version 1.13 is the current ODI spec version we support
+MLIDConfigTable MLIDConfig <'HardwareDriverMLID        ', 01h, 13h>
 
 RegisterWithLSL PROC
     push    ax
@@ -2540,24 +2763,29 @@ RegisterWithLSL PROC
     mov     MLIDConfigTable.TransportTime, 1
     mov     MLIDConfigTable.LineSpeed, 8000h + 115  ; 115 Kbps (high bit = Kbps)
     mov     MLIDConfigTable.LookAheadSize, 64
-    mov     MLIDConfigTable.QueueDepth, 4
     
     ; No source route handler
     mov     word ptr MLIDConfigTable.SourceRouteHandler[0], 0
     mov     word ptr MLIDConfigTable.SourceRouteHandler[2], 0
     
-    ; Clear reserved bytes
-    lea     di, MLIDConfigTable.Reserved2
+    ; Clear reserved bytes at 48h (6 bytes per ODI spec)
+    lea     di, MLIDConfigTable.Reserved1_6
     mov     cx, 6
     xor     al, al
     rep     stosb
+    
+    ; Priority support (0 = no priority packet support)
+    mov     MLIDConfigTable.PrioritySup, 0
+    
+    ; Bus ID (FFh = default/auto-detect)
+    mov     MLIDConfigTable.BusID, 0FFh
     
     ; Driver version
     mov     MLIDConfigTable.DriverMajorVer, 1
     mov     MLIDConfigTable.DriverMinorVer, 0
     
-    ; Bus/multicast flags (ISA card)
-    mov     MLIDConfigTable.BusMulticastFlags, 0002h
+    ; MFlags (bit 1 = multicast supported if set)
+    mov     MLIDConfigTable.MFlags, 0002h
     
     ; Send retries
     mov     MLIDConfigTable.SendRetries, 3
@@ -2590,9 +2818,9 @@ RegisterWithLSL PROC
     ; IRQ and DMA
     mov     al, CfgData.IRQNum
     mov     MLIDConfigTable.IRQLine1, al
-    mov     MLIDConfigTable.IRQLine2, 0
-    mov     MLIDConfigTable.DMALine1, 0
-    mov     MLIDConfigTable.DMALine2, 0
+    mov     MLIDConfigTable.IRQLine2, 0FFh      ; FFh = unused per ODI spec
+    mov     MLIDConfigTable.DMALine1, 0FFh      ; FFh = no DMA used
+    mov     MLIDConfigTable.DMALine2, 0FFh      ; FFh = unused
     
     ; Set up interface function table
     mov     word ptr MLIDFunctions.GetStatistics[2], cs
@@ -2635,16 +2863,6 @@ RegisterWithLSL PROC
     lea     si, MLIDInfoBlockData   ; Point to info block wrapper, NOT config table
     lea     di, LSLInfoBuf
     
-    ; Debug: print function call info
-    cmp     CmdDebug, 1
-    jne     SkipDbgCallLSL
-    push    dx
-    lea     dx, MsgDbgCallLSL
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgCallLSL:
-    
     mov     bx, 0001h               ; Function 0001h: RegisterMLID (LSL 2.x)
     call    dword ptr [LSLEntryOff]
 
@@ -2652,25 +2870,7 @@ SkipDbgCallLSL:
     cmp     ax, 0
     je      RegisterOK
     
-    ; Debug: print failure and return code
-    push    ax                  ; Save return code
-    cmp     CmdDebug, 1
-    jne     SkipDbgLSLFail
-    push    dx
-    lea     dx, MsgDbgLSLFail
-    mov     ah, 09h
-    int     21h
-    pop     dx
-    pop     ax
-    push    ax
-    call    PrintHexWord
-    push    dx
-    lea     dx, MsgDbgLSLRet
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgLSLFail:
-    pop     ax
+    ; Registration failed
     stc
     jmp     RegisterDone
 
@@ -2678,16 +2878,6 @@ RegisterOK:
     ; Save board number assigned by LSL (returned in BX)
     mov     MLIDConfigTable.BoardNumber, bx
     mov     LSLBoardNum, bx
-    
-    ; Debug: print OK
-    cmp     CmdDebug, 1
-    jne     SkipDbgLSLOK
-    push    dx
-    lea     dx, MsgDbgOK
-    mov     ah, 09h
-    int     21h
-    pop     dx
-SkipDbgLSLOK:
     clc
 
 RegisterDone:
@@ -2707,9 +2897,10 @@ RegisterWithLSL ENDP
 
 MLIDGetStats PROC FAR
     ; Return pointer to statistics in ES:SI
-    push    ds
+    ; Use CS since that's always the TSR segment, not DS which may be wrong
+    push    cs
     pop     es
-    lea     si, Statistics
+    lea     si, cs:Statistics
     xor     ax, ax              ; Success
     retf
 MLIDGetStats ENDP
@@ -2731,16 +2922,18 @@ MLIDShutdownProc PROC FAR
     ; Entry: AX = board number, CX = 0000h for permanent, non-zero for temporary
     ; NOTE: This just clears internal state. Deregistration from LSL must be
     ; done by UnloadDriver with proper segment setup.
-    mov     DriverActive, 0
+    ; Use CS: override since DS may not point to TSR when called from unloader
+    mov     cs:DriverActive, 0
     xor     ax, ax
     retf
 MLIDShutdownProc ENDP
 
 MLIDResetProc PROC FAR
     ; Reset the MLID - reinitialize buffers
-    mov     RxState, 0          ; STATE_IDLE = 0
-    mov     RxBufIdx, 0
-    mov     TxPending, 0
+    ; Use CS: override since DS may not point to TSR when called externally
+    mov     cs:RxState, 0          ; STATE_IDLE = 0
+    mov     cs:RxBufIdx, 0
+    mov     cs:TxPending, 0
     xor     ax, ax
     retf
 MLIDResetProc ENDP
@@ -2749,13 +2942,13 @@ MLIDResetProc ENDP
 ; INT 2Fh Multiplex Handler
 ;=============================================================================
 
-; DCEMLID uses C0A0h/C0A1h, LSL uses C000h-C00Fh
-; We must check for our specific AL values to avoid intercepting LSL calls!
+; DCEMLID uses C0A0h+board*10h, LSL uses C000h-C00Fh
+; Each board instance has its own multiplex ID: board 0=C0A0, 1=C0B0, etc.
 
 Int2FHandler PROC FAR
-    cmp     ax, 0C0A0h              ; Installation check (our specific ID)
+    cmp     ax, cs:[MuxID]          ; Installation check (board-specific ID)
     je      Mux_InstallCheck
-    cmp     ax, 0C0A1h              ; Get info subfunction
+    cmp     ax, cs:[MuxIDInfo]      ; Get info subfunction (MuxID + 1)
     je      Mux_GetInfo
     
     ; Not ours - chain to previous handler
@@ -3147,6 +3340,7 @@ SerialISR ENDP
 
 ;=============================================================================
 ; Parallel Port Interrupt Service Routine
+; Handles both PAR4 (4-bit nibble) and PAR8 (8-bit EPP/PS2) modes
 ;=============================================================================
 
 ParallelISR PROC FAR
@@ -3159,6 +3353,108 @@ ParallelISR PROC FAR
     mov     ax, cs              ; .COM file: CS=DS=ES
     mov     ds, ax
 
+    ; Branch based on mode: PAR4 (Mode=1) or PAR8 (Mode=2)
+    cmp     CfgData.Mode, 1
+    je      Par4ISR_Entry
+    jmp     Par8ISR_Entry
+
+;-----------------------------------------------------------------------------
+; PAR4 Mode ISR - 4-bit nibble receive using LapLink protocol
+;-----------------------------------------------------------------------------
+Par4ISR_Entry:
+    ; In PAR4 mode, their D4 going high triggers our BUSY signal
+    ; Status bit 7 (BUSY) is INVERTED: 0 = their D4 high, 1 = their D4 low
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
+    
+    ; Check if their D4 is high (data ready) - status bit 7 will be 0
+    test    al, LPT_STAT_NBUSY
+    jnz     Par4ISR_CheckTx     ; Bit 7=1 means their D4 low, no data
+    
+    ; Their D4 is high - data nibble ready, read it
+    ; Nibble comes from: nERROR(bit3)=D0, SELECT(bit4)=D1, PE(bit5)=D2, nACK(bit6)=D3
+    mov     cl, 3
+    shr     al, cl              ; Shift right by 3 to get nibble in bits 0-3
+    and     al, 0Fh             ; Mask to 4 bits
+    
+    ; Acknowledge: set our D4 high
+    push    ax
+    mov     dx, CfgData.Port
+    mov     al, 10h             ; D4 = bit 4 = 10h
+    out     dx, al
+    
+    ; Short delay for signal propagation
+    mov     cx, 10
+Par4ACK_Delay1:
+    loop    Par4ACK_Delay1
+    
+    ; Wait for their D4 to go low (status bit 7 = 1)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    mov     cx, 0FFFFh
+Par4WaitD4Low:
+    in      al, dx
+    test    al, LPT_STAT_NBUSY
+    jnz     Par4D4IsLow         ; Bit 7=1 means their D4 went low
+    dec     cx
+    jnz     Par4WaitD4Low
+    ; Timeout - clear D4 and exit
+    mov     dx, CfgData.Port
+    xor     al, al
+    out     dx, al
+    pop     ax
+    jmp     ParISR_Done
+    
+Par4D4IsLow:
+    ; Clear our D4
+    mov     dx, CfgData.Port
+    xor     al, al
+    out     dx, al
+    pop     ax                  ; Restore received nibble
+    
+    ; Process nibble - assemble into byte
+    cmp     Par4RxHaveNib, 0
+    jne     Par4HaveHigh
+    
+    ; This is low nibble - store it and wait for high nibble
+    mov     Par4RxNibble, al
+    mov     Par4RxHaveNib, 1
+    jmp     Par4ISR_CheckTx
+    
+Par4HaveHigh:
+    ; This is high nibble - combine with stored low nibble
+    mov     cl, 4
+    shl     al, cl              ; Shift high nibble to bits 4-7
+    or      al, Par4RxNibble    ; Combine with low nibble
+    mov     Par4RxHaveNib, 0    ; Reset for next byte
+    
+    ; AL now has the complete byte - process it
+    call    ProcessReceivedByte
+    
+    ; Check for more data (loop back)
+    jmp     Par4ISR_Entry
+    
+Par4ISR_CheckTx:
+    ; Check if remote is ready (their INIT reflects as our SELECT/Online)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    in      al, dx
+    test    al, LPT_STAT_ONLINE
+    jz      ParISR_Done         ; Remote not ready
+    
+    ; Check if transmit pending
+    cmp     TxPending, 0
+    je      ParISR_Done
+    
+    ; Send next byte via nibble mode
+    call    Par4SendNextByte
+    jmp     ParISR_Done
+
+;-----------------------------------------------------------------------------
+; PAR8 Mode ISR - 8-bit EPP/PS2 receive
+;-----------------------------------------------------------------------------
+Par8ISR_Entry:
     ; Read status register to check interrupt source
     mov     dx, CfgData.Port
     add     dx, LPT_STATUS
@@ -3166,7 +3462,7 @@ ParallelISR PROC FAR
     
     ; Check if nACK is low (data available in EPP mode)
     test    al, LPT_STAT_NACK
-    jnz     ParISR_CheckTx      ; nACK high = no incoming data
+    jnz     Par8ISR_CheckTx     ; nACK high = no incoming data
     
     ; Read data from EPP data port
     mov     dx, CfgData.Port
@@ -3174,7 +3470,7 @@ ParallelISR PROC FAR
     
     ; Read loop with timeout
     mov     cx, 0FFFFh          ; Timeout counter
-ParISR_ReadLoop:
+Par8ISR_ReadLoop:
     ; Check if data ready (nBusy low = data valid)
     push    dx
     mov     dx, CfgData.Port
@@ -3182,12 +3478,12 @@ ParISR_ReadLoop:
     in      al, dx
     pop     dx
     test    al, LPT_STAT_NBUSY
-    jz      ParISR_DataReady    ; nBusy low = data valid
+    jz      Par8ISR_DataReady   ; nBusy low = data valid
     dec     cx
-    jnz     ParISR_ReadLoop
+    jnz     Par8ISR_ReadLoop
     jmp     ParISR_Done         ; Timeout - no data
     
-ParISR_DataReady:
+Par8ISR_DataReady:
     ; Read the byte from EPP data port
     in      al, dx
     
@@ -3199,9 +3495,9 @@ ParISR_DataReady:
     add     dx, LPT_STATUS
     in      al, dx
     test    al, LPT_STAT_NACK
-    jz      ParISR_ReadLoop     ; More data pending
+    jz      Par8ISR_ReadLoop    ; More data pending
     
-ParISR_CheckTx:
+Par8ISR_CheckTx:
     ; Check if remote signaled "not ready" (their INIT reflects as SELECT status)
     mov     dx, CfgData.Port
     add     dx, LPT_STATUS
@@ -3218,7 +3514,7 @@ ParISR_CheckTx:
     je      ParISR_Done         ; No pending transmit
     
     ; Send next byte from TX buffer
-    call    ParallelSendNextByte
+    call    Par8SendNextByte
     
 ParISR_Done:
     ; Send EOI to PIC (handle PIC2 for IRQ >= 8)
@@ -3239,9 +3535,163 @@ ParISR_EOI1:
 ParallelISR ENDP
 
 ;=============================================================================
-; ParallelSendNextByte - Send next byte from TX buffer via parallel port
+; Par4SendNextByte - Send next byte as two nibbles with LapLink handshaking
 ;=============================================================================
-ParallelSendNextByte PROC
+Par4SendNextByte PROC
+    push    ax
+    push    bx
+    push    cx
+    push    dx
+    push    si
+    
+    ; Check if we're in the middle of sending high nibble
+    cmp     Par4TxNibble, 0
+    jne     Par4SendHighNibble
+    
+    ; Get next byte from TX buffer
+    mov     si, TxOutPtr
+    cmp     si, TxInPtr
+    je      Par4Send_Empty      ; Buffer empty
+    
+    mov     al, TxFrameBuffer[si]
+    mov     Par4TxByte, al      ; Save for high nibble
+    
+    ; Send low nibble (bits 0-3)
+    and     al, 0Fh             ; Isolate low nibble
+    or      al, 10h             ; Set D4 high (data valid strobe)
+    mov     dx, CfgData.Port
+    out     dx, al
+    
+    ; Wait for remote ack (their D4 high = our BUSY status bit 7 low)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    mov     cx, 0FFFFh
+Par4TX_WaitAck1:
+    in      al, dx
+    test    al, LPT_STAT_NBUSY
+    jz      Par4TX_GotAck1      ; Bit 7=0 means they acked
+    dec     cx
+    jnz     Par4TX_WaitAck1
+    jmp     Par4Send_Timeout
+    
+Par4TX_GotAck1:
+    ; Clear D4 to complete handshake
+    mov     dx, CfgData.Port
+    xor     al, al
+    out     dx, al
+    
+    ; Wait for remote to clear their D4 (status bit 7 = 1)
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    mov     cx, 0FFFFh
+Par4TX_WaitClear1:
+    in      al, dx
+    test    al, LPT_STAT_NBUSY
+    jnz     Par4TX_Cleared1     ; Bit 7=1 means they cleared
+    dec     cx
+    jnz     Par4TX_WaitClear1
+    jmp     Par4Send_Timeout
+    
+Par4TX_Cleared1:
+    ; Mark that we need to send high nibble next
+    mov     Par4TxNibble, 1
+    jmp     Par4Send_Done
+    
+Par4SendHighNibble:
+    ; Send high nibble (bits 4-7 of saved byte)
+    mov     al, Par4TxByte
+    mov     cl, 4
+    shr     al, cl              ; Shift high nibble to bits 0-3
+    or      al, 10h             ; Set D4 high (data valid strobe)
+    mov     dx, CfgData.Port
+    out     dx, al
+    
+    ; Wait for remote ack
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    mov     cx, 0FFFFh
+Par4TX_WaitAck2:
+    in      al, dx
+    test    al, LPT_STAT_NBUSY
+    jz      Par4TX_GotAck2
+    dec     cx
+    jnz     Par4TX_WaitAck2
+    jmp     Par4Send_Timeout
+    
+Par4TX_GotAck2:
+    ; Clear D4
+    mov     dx, CfgData.Port
+    xor     al, al
+    out     dx, al
+    
+    ; Wait for remote clear
+    mov     dx, CfgData.Port
+    add     dx, LPT_STATUS
+    mov     cx, 0FFFFh
+Par4TX_WaitClear2:
+    in      al, dx
+    test    al, LPT_STAT_NBUSY
+    jnz     Par4TX_Cleared2
+    dec     cx
+    jnz     Par4TX_WaitClear2
+    jmp     Par4Send_Timeout
+    
+Par4TX_Cleared2:
+    ; Byte complete - advance buffer pointer
+    mov     Par4TxNibble, 0     ; Reset for next byte
+    mov     si, TxOutPtr
+    inc     si
+    cmp     si, TX_BUFFER_SIZE
+    jb      Par4TX_NoWrap
+    xor     si, si
+Par4TX_NoWrap:
+    mov     TxOutPtr, si
+    
+    ; Check if buffer now empty
+    cmp     si, TxInPtr
+    jne     Par4Send_Done
+    mov     TxPending, 0
+    
+    ; Complete ECB if any
+    push    es
+    les     si, dword ptr TxCurrentECB
+    cmp     si, 0
+    je      Par4TX_NoECB
+    cmp     word ptr TxCurrentECB+2, 0
+    je      Par4TX_NoECB
+    mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
+    call    CompleteTransmitECB
+Par4TX_NoECB:
+    pop     es
+    jmp     Par4Send_Done
+    
+Par4Send_Timeout:
+    ; Timeout - clear data lines and mark error
+    mov     dx, CfgData.Port
+    xor     al, al
+    out     dx, al
+    mov     Par4TxNibble, 0
+    ; Fall through to error handling
+    inc     word ptr MLIDStatistics.MTxMiscError
+    adc     word ptr MLIDStatistics.MTxMiscError+2, 0
+    jmp     Par4Send_Done
+    
+Par4Send_Empty:
+    mov     TxPending, 0
+    
+Par4Send_Done:
+    pop     si
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
+    ret
+Par4SendNextByte ENDP
+
+;=============================================================================
+; Par8SendNextByte - Send next byte via EPP data port (PAR8 mode)
+;=============================================================================
+Par8SendNextByte PROC
     push    ax
     push    dx
     push    si
@@ -3249,14 +3699,14 @@ ParallelSendNextByte PROC
     ; Get next byte from TX buffer
     mov     si, TxOutPtr
     cmp     si, TxInPtr
-    je      ParSend_Empty       ; Buffer empty
+    je      Par8Send_Empty      ; Buffer empty
     
     mov     al, TxFrameBuffer[si]
     inc     si
     cmp     si, TX_BUFFER_SIZE
-    jb      ParSend_NoWrap
+    jb      Par8Send_NoWrap
     xor     si, si              ; Wrap around
-ParSend_NoWrap:
+Par8Send_NoWrap:
     mov     TxOutPtr, si
     
     ; Send byte via EPP data port
@@ -3267,31 +3717,31 @@ ParSend_NoWrap:
     ; Check if buffer now empty
     mov     si, TxOutPtr
     cmp     si, TxInPtr
-    jne     ParSend_Done
+    jne     Par8Send_Done
     mov     TxPending, 0        ; Clear pending flag
     
     ; Complete current ECB if any
     push    es
     les     si, dword ptr TxCurrentECB
     cmp     si, 0
-    je      ParSend_NoECB
+    je      Par8Send_NoECB
     cmp     word ptr TxCurrentECB+2, 0
-    je      ParSend_NoECB
+    je      Par8Send_NoECB
     mov     byte ptr es:[si+ECB_CompCode], ECB_SUCCESS
     call    CompleteTransmitECB
-ParSend_NoECB:
+Par8Send_NoECB:
     pop     es
-    jmp     ParSend_Done
+    jmp     Par8Send_Done
     
-ParSend_Empty:
+Par8Send_Empty:
     mov     TxPending, 0
     
-ParSend_Done:
+Par8Send_Done:
     pop     si
     pop     dx
     pop     ax
     ret
-ParallelSendNextByte ENDP
+Par8SendNextByte ENDP
 
 ;=============================================================================
 ; ProcessReceivedByte - Process received byte through frame parser FSM
@@ -4095,6 +4545,25 @@ MLIDReceiveHandler ENDP
 MLIDTransmitHandler PROC FAR
     ; ES:SI = ECB to send
     ; Called by IPX to queue a packet for transmission
+    
+    ; DEBUG: Write 'T' to video memory
+    push    es
+    push    di
+    push    ax
+    mov     ax, 0B800h
+    mov     es, ax
+    mov     di, cs:CtlDebugPos
+    mov     al, 'T'
+    mov     ah, 0Ah             ; Green on black
+    stosw
+    mov     al, ' '
+    mov     ah, 0Ah
+    stosw
+    mov     cs:CtlDebugPos, di
+    pop     ax
+    pop     di
+    pop     es
+    
     push    ax
     push    bx
     push    cx
@@ -4646,6 +5115,41 @@ QueueStillHasItems:
 CompleteTransmitECB ENDP
 
 MLIDControlHandler PROC FAR
+    ; DEBUG: Write function code to video memory at position based on call count
+    ; This is safe in TSR context (no DOS reentrancy)
+    push    es
+    push    di
+    push    ax
+    push    bx
+    mov     ax, 0B800h          ; Video memory segment
+    mov     es, ax
+    ; Use CS:DebugPos as index (increments each call)
+    mov     di, cs:CtlDebugPos
+    ; Write 'C'
+    mov     al, 'C'
+    mov     ah, 0Eh             ; Yellow on black
+    stosw
+    ; Write function code as hex
+    mov     ax, bx
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@vok
+    add     al, 7
+@@vok:
+    mov     ah, 0Eh
+    stosw
+    ; Write space
+    mov     al, ' '
+    mov     ah, 0Eh
+    stosw
+    ; Update position for next call
+    mov     cs:CtlDebugPos, di
+    pop     bx
+    pop     ax
+    pop     di
+    pop     es
+    
     ; BX = function code (ODI standard per spec page 18-10 to 18-20)
     ; Function 0: GetMLIDConfiguration (required)
     ; Function 1: GetMLIDStatistics (required)
@@ -4670,7 +5174,32 @@ MLIDControlHandler PROC FAR
     cmp     bx, 10              ; PromiscuousChange
     je      DoPromiscuous
     
-    ; Unsupported function
+    ; Unsupported function - debug: write 'X' and function code
+    push    es
+    push    di
+    push    ax
+    mov     ax, 0B800h
+    mov     es, ax
+    mov     di, cs:CtlDebugPos
+    mov     al, 'X'
+    mov     ah, 0Ch             ; Red on black
+    stosw
+    mov     ax, bx
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@xok
+    add     al, 7
+@@xok:
+    mov     ah, 0Ch
+    stosw
+    mov     al, ' '
+    mov     ah, 0Ch
+    stosw
+    mov     cs:CtlDebugPos, di
+    pop     ax
+    pop     di
+    pop     es
     mov     ax, 8008h           ; LSLERR_BAD_COMMAND
     retf
 
@@ -4681,6 +5210,20 @@ DoGetConfig:
     pop     es
     lea     si, MLIDConfigTable
     xor     ax, ax              ; AX=0 = success
+    ; DEBUG: show we're returning from C0
+    push    di
+    mov     di, cs:CtlDebugPos
+    push    ax
+    mov     ax, 0B800h
+    push    es
+    mov     es, ax
+    mov     al, 'r'
+    mov     ah, 0Fh
+    stosw
+    mov     cs:CtlDebugPos, di
+    pop     es
+    pop     ax
+    pop     di
     retf
 
 DoGetStats:
@@ -4689,6 +5232,20 @@ DoGetStats:
     pop     es
     lea     si, MLIDStatistics
     xor     ax, ax              ; AX=0 = success
+    ; DEBUG: show we're returning from C1
+    push    di
+    mov     di, cs:CtlDebugPos
+    push    ax
+    mov     ax, 0B800h
+    push    es
+    mov     es, ax
+    mov     al, 's'
+    mov     ah, 0Fh
+    stosw
+    mov     cs:CtlDebugPos, di
+    pop     es
+    pop     ax
+    pop     di
     retf
 
 DoRegisterTxMon:
@@ -4810,27 +5367,128 @@ PrintModeStr:
     mov     ah, 09h
     int     21h
 
-    ; Print port
+    ; Print port label
     lea     dx, MsgPort
     mov     ah, 09h
     int     21h
-    mov     ax, CfgData.Port
-    call    PrintHexWord
+    
+    ; Print CfgData.Port as 4 hex digits - INLINE
+    push    bx
+    push    cx
+    mov     bx, CfgData.Port
+    ; Digit 1: high nibble of BH
+    mov     al, bh
+    mov     cl, 4
+    shr     al, cl
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@p1
+    add     al, 7
+@@p1:
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
+    ; Digit 2: low nibble of BH
+    mov     al, bh
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@p2
+    add     al, 7
+@@p2:
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
+    ; Digit 3: high nibble of BL
+    mov     al, bl
+    mov     cl, 4
+    shr     al, cl
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@p3
+    add     al, 7
+@@p3:
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
+    ; Digit 4: low nibble of BL
+    mov     al, bl
+    and     al, 0Fh
+    add     al, '0'
+    cmp     al, '9'
+    jbe     @@p4
+    add     al, 7
+@@p4:
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
+    pop     cx
+    pop     bx
 
-    ; Print IRQ
+    ; Print IRQ label
     lea     dx, MsgIRQ
     mov     ah, 09h
     int     21h
+    
+    ; Print IRQ as decimal INLINE (max 15, so 1-2 digits)
     xor     ax, ax
     mov     al, CfgData.IRQNum
-    call    PrintDecimal
+    ; If >= 10, print tens digit
+    cmp     al, 10
+    jb      @@irq_ones
+    ; Print '1' for tens
+    push    ax
+    mov     dl, '1'
+    mov     ah, 02h
+    int     21h
+    pop     ax
+    sub     al, 10
+@@irq_ones:
+    add     al, '0'
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
 
-    ; Print MAC address
+    ; Print MAC address label
     lea     dx, MsgMAC
     mov     ah, 09h
     int     21h
-    lea     si, CfgData.MacAddr
-    call    PrintMACAddress
+    
+    ; Print MAC address using PrintHexByte
+    mov     al, CfgData.MacAddr
+    call    PrintHexByte
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+    
+    mov     al, CfgData.MacAddr+1
+    call    PrintHexByte
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+    
+    mov     al, CfgData.MacAddr+2
+    call    PrintHexByte
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+    
+    mov     al, CfgData.MacAddr+3
+    call    PrintHexByte
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+    
+    mov     al, CfgData.MacAddr+4
+    call    PrintHexByte
+    mov     dl, '-'
+    mov     ah, 02h
+    int     21h
+    
+    mov     al, CfgData.MacAddr+5
+    call    PrintHexByte
 
     ; Print baud rate if serial
     cmp     CfgData.Mode, 0
@@ -4933,112 +5591,111 @@ PrintMemMsg:
 PrintInstallMessage ENDP
 
 ;=============================================================================
-; PrintDetectionInfo - Print port/mode before hardware detection
-;=============================================================================
-
-PrintDetectionInfo PROC
-    push    ax
-    push    dx
-
-    ; Print "Detecting hardware at port "
-    lea     dx, MsgDbgPort
-    mov     ah, 09h
-    int     21h
-
-    ; Print port value in hex
-    mov     ax, CfgData.Port
-    call    PrintHexWord
-
-    ; Print " mode="
-    lea     dx, MsgDbgMode
-    mov     ah, 09h
-    int     21h
-
-    ; Print mode name
-    cmp     CfgData.Mode, 0
-    je      PrintModeSerial
-    cmp     CfgData.Mode, 1
-    je      PrintModePar4
-    cmp     CfgData.Mode, 2
-    je      PrintModePar8
-    jmp     PrintModeEnd
-
-PrintModeSerial:
-    lea     dx, MsgDbgSerial
-    jmp     PrintModeName
-PrintModePar4:
-    lea     dx, MsgDbgPar4
-    jmp     PrintModeName
-PrintModePar8:
-    lea     dx, MsgDbgPar8
-
-PrintModeName:
-    mov     ah, 09h
-    int     21h
-
-PrintModeEnd:
-    ; Print newline
-    lea     dx, MsgCRLF
-    mov     ah, 09h
-    int     21h
-
-    pop     dx
-    pop     ax
-    ret
-PrintDetectionInfo ENDP
-
-;=============================================================================
 ; Helper Printing Functions
 ;=============================================================================
 
 PrintHexWord PROC
-    ; Print AX as hex
+    ; Print AX as 4 hex digits (e.g., 03F8)
+    ; Preserves all registers except flags
     push    ax
-    mov     al, ah
-    call    PrintHexByte
+    push    bx
+    push    cx
+    push    dx
+    
+    mov     bx, ax          ; Save value in BX
+    
+    ; Print high byte, high nibble
+    mov     al, bh
+    mov     cl, 4
+    shr     al, cl
+    call    PrintNibble
+    
+    ; Print high byte, low nibble
+    mov     al, bh
+    and     al, 0Fh
+    call    PrintNibble
+    
+    ; Print low byte, high nibble
+    mov     al, bl
+    mov     cl, 4
+    shr     al, cl
+    call    PrintNibble
+    
+    ; Print low byte, low nibble
+    mov     al, bl
+    and     al, 0Fh
+    call    PrintNibble
+    
+    pop     dx
+    pop     cx
+    pop     bx
     pop     ax
-    call    PrintHexByte
     ret
 PrintHexWord ENDP
 
+PrintNibble PROC
+    ; Print nibble in AL (0-15) as hex digit
+    ; Destroys DL, AH
+    and     al, 0Fh
+    cmp     al, 10
+    jb      @@Digit
+    add     al, 'A' - 10
+    jmp     @@Print
+@@Digit:
+    add     al, '0'
+@@Print:
+    mov     dl, al
+    mov     ah, 02h
+    int     21h
+    ret
+PrintNibble ENDP
+
 PrintHexByte PROC
-    ; Print AL as hex
+    ; Print AL as 2 hex digits
+    ; NOTE: Cannot use AH to save value - INT 21h clobbers it!
     push    ax
+    push    bx
     push    cx
+    push    dx
+    
+    mov     bl, al          ; Save original in BL (safe from INT 21h)
     mov     cl, 4
     shr     al, cl
-    call    PrintHexDigit
-    pop     cx
-    pop     ax
+    call    PrintNibble     ; Print high nibble
+    mov     al, bl          ; Restore from BL
     and     al, 0Fh
-    call    PrintHexDigit
+    call    PrintNibble     ; Print low nibble
+    
+    pop     dx
+    pop     cx
+    pop     bx
+    pop     ax
     ret
 PrintHexByte ENDP
 
 PrintHexDigit PROC
-    ; Print hex digit in AL
-    cmp     al, 10
-    jb      HexDigitNumeric
-    add     al, 'A' - 10
-    jmp     HexDigitPrint
-HexDigitNumeric:
-    add     al, '0'
-HexDigitPrint:
-    push    dx
-    mov     dl, al
-    mov     ah, 02h
-    int     21h
-    pop     dx
+    ; Wrapper for compatibility - just call PrintNibble
+    call    PrintNibble
     ret
 PrintHexDigit ENDP
 
 PrintDecimal PROC
     ; Print AX as decimal
+    ; Fixed: handles AX=0 correctly (prints "0" instead of nothing)
     push    ax
     push    bx
     push    cx
     push    dx
 
+    ; Special case: if AX=0, just print '0' and return
+    test    ax, ax
+    jnz     DecimalNonZero
+    mov     dl, '0'
+    mov     ah, 02h
+    int     21h
+    jmp     DecimalDone
+
+DecimalNonZero:
     xor     cx, cx
     mov     bx, 10
 
@@ -5057,6 +5714,7 @@ PrintDigits:
     int     21h
     loop    PrintDigits
 
+DecimalDone:
     pop     dx
     pop     cx
     pop     bx
@@ -5089,8 +5747,13 @@ PrintMACAddress ENDP
 ;=============================================================================
 
 UnloadDriver PROC
-    ; Check if driver is loaded via multiplex (subfunction 01h to get info)
-    mov     ax, MULTIPLEX_ID + 01h  ; AH=ID, AL=01h (get info)
+    ; Calculate multiplex ID for specified board
+    mov     ax, CfgData.BoardNum
+    shl     ax, 4                   ; * 16
+    add     ax, MULTIPLEX_ID_BASE
+    inc     ax                      ; +1 for get info subfunction
+    
+    ; Check if this specific board is loaded
     int     2Fh
     cmp     al, 0FFh
     jne     NotLoaded
@@ -5131,13 +5794,69 @@ UnloadDriver PROC
     ; Restore ES to TSR segment for further use
     mov     es, Unload_TSRSeg
     
+    ; ===== DISABLE HARDWARE INTERRUPTS FIRST =====
+    ; IMPORTANT: Must disable hardware IRQ BEFORE calling LSL to prevent
+    ; ISR reentrancy - if an IRQ fires during LSL deregister call, the ISR
+    ; might try to call LSL functions, causing a hang due to reentrancy.
+    
+    ; Disable interrupts at CPU level during critical section
+    cli
+    
+    ; Disable IRQ at PIC FIRST (prevents new interrupts from being delivered)
+    mov     al, Unload_TSRIRQNum
+    cmp     al, 8
+    jb      DisablePIC1
+    
+    ; IRQ 8-15: Use slave PIC (port 0A1h)
+    sub     al, 8
+    mov     cl, al
+    mov     al, 1
+    shl     al, cl                  ; AL = mask bit for this IRQ
+    mov     ah, al                  ; Save mask bit
+    in      al, 0A1h
+    or      al, ah                  ; Set the mask bit to disable IRQ
+    out     0A1h, al
+    jmp     PICDisabled
+
+DisablePIC1:
+    ; IRQ 0-7: Use master PIC (port 021h)
+    mov     cl, al
+    mov     al, 1
+    shl     al, cl                  ; AL = mask bit for this IRQ
+    mov     ah, al                  ; Save mask bit
+    in      al, 021h
+    or      al, ah                  ; Set the mask bit to disable IRQ
+    out     021h, al
+
+PICDisabled:
+    ; Now disable at hardware level
+    mov     dx, Unload_TSRPort
+    cmp     Unload_TSRMode, 0
+    jne     DisableParallel
+
+    ; Disable serial interrupts (IER = 0)
+    add     dx, UART_IER
+    xor     al, al
+    out     dx, al
+    jmp     HWInterruptsDisabled
+
+DisableParallel:
+    ; Disable parallel interrupts (clear IRQ enable bit in control register)
+    add     dx, LPT_CONTROL
+    mov     al, LPT_CTRL_INIT       ; nINIT high, IRQ disabled
+    out     dx, al
+
+HWInterruptsDisabled:
+    ; Re-enable CPU interrupts - safe now since our IRQ is masked
+    sti
+    
     ; ===== DEREGISTER FROM LSL =====
+    ; Now safe to call LSL - no ISR reentrancy possible
     ; Call DeregisterMLID via LSL MLID Support entry point
-    ; The entry point is in the TSR's LSLInfoBuf.LSLEntryPoint
     ; BX = 0006h (DeregisterMLID = MLIDSUP_DEREGISTER_MLID), AX = board number
-    ; MUST use ES: override since DS points to unloader, not TSR!
+    mov     es, Unload_TSRSeg       ; Ensure ES = TSR segment
     mov     ax, es:[LSLBoardNum]    ; Get board number from TSR
-    mov     bx, 0006h               ; DeregisterMLID function (6, not 2!)
+    mov     bx, 0006h               ; DeregisterMLID function
     call    dword ptr es:[LSLInfoBuf.LSLEntryPoint]
     
     ; Check for deregistration error
@@ -5159,52 +5878,6 @@ DeregisterOK:
     mov     es, Unload_TSRSeg       ; Restore ES in case LSL call modified it
     xor     cx, cx                  ; CX=0000h = permanent shutdown
     call    dword ptr es:[MLIDFunctions.MLIDShutdown]
-    
-    ; ===== DISABLE HARDWARE INTERRUPTS =====
-    mov     dx, Unload_TSRPort
-    cmp     Unload_TSRMode, 0
-    jne     DisableParallel
-
-    ; Disable serial interrupts
-    add     dx, UART_IER
-    xor     al, al
-    out     dx, al
-    jmp     InterruptsDisabled
-
-DisableParallel:
-    ; Disable parallel interrupts
-    add     dx, LPT_CONTROL
-    mov     al, LPT_CTRL_INIT
-    out     dx, al
-
-InterruptsDisabled:
-    ; ===== DISABLE IRQ AT PIC =====
-    mov     al, Unload_TSRIRQNum
-    cmp     al, 8
-    jb      DisablePIC1
-    
-    ; IRQ 8-15: Use slave PIC (port 0A1h)
-    sub     al, 8
-    mov     cl, al
-    mov     al, 1
-    shl     al, cl                  ; AL = mask bit for this IRQ
-    mov     ah, al                  ; Save mask bit
-    in      al, 0A1h
-    or      al, ah                  ; Set the mask bit to disable IRQ
-    out     0A1h, al
-    jmp     IRQDisabled
-
-DisablePIC1:
-    ; IRQ 0-7: Use master PIC (port 021h)
-    mov     cl, al
-    mov     al, 1
-    shl     al, cl                  ; AL = mask bit for this IRQ
-    mov     ah, al                  ; Save mask bit
-    in      al, 021h
-    or      al, ah                  ; Set the mask bit to disable IRQ
-    out     021h, al
-
-IRQDisabled:
     ; ===== RESTORE INTERRUPT VECTORS =====
     ; Access TSR's saved vectors via Unload_TSRSeg
     mov     es, Unload_TSRSeg
